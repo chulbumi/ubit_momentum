@@ -352,10 +352,10 @@ GET /v1/market/all
 
 **초(Second) 캔들 조회**
 ```
-GET /v1/candles/seconds/{unit}
+GET /v1/candles/seconds
 ```
 
-**지원 단위**: 1, 3, 5, 10, 30, 60
+**지원 단위**: 1초 (단일 단위 지원)
 
 **파라미터**:
 - `market` (string, required): 마켓 코드 (예: KRW-BTC)
