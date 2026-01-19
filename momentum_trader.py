@@ -51,10 +51,10 @@ MACRO_BULLISH_THRESHOLD = 0.01     # 상승장 판단 기준 (+1% 이상)
 MACRO_UPDATE_INTERVAL = 300         # 거시 분석 갱신 주기 (초)
 
 # === 미시적 분석 (Micro Analysis) - 진입 신호 ===
-MOMENTUM_WINDOW = 10                # 모멘텀 계산 윈도우 (캔들 개수)
-MOMENTUM_THRESHOLD = 0.003          # 진입 모멘텀 기준 (0.3% 상승률)
-VOLUME_SPIKE_RATIO = 1.5            # 거래량 급등 배율 (평균 대비)
-CONSECUTIVE_UP_CANDLES = 3          # 연속 상승 캔들 개수
+MOMENTUM_WINDOW = 15                # 모멘텀 계산 윈도우 (캔들 개수) - 추세 신뢰도 강화
+MOMENTUM_THRESHOLD = 0.006          # 진입 모멘텀 기준 (0.6% 상승률) - 가짜 신호 필터링
+VOLUME_SPIKE_RATIO = 2.0            # 거래량 급등 배율 (평균 대비) - 수급 확인 강화
+CONSECUTIVE_UP_CANDLES = 4          # 연속 상승 캔들 개수 - 추세 지속성 확인
 
 # === 초봉 분석 (Second Candle Analysis) - 실시간 변화 감지 ===
 SECOND_CANDLE_UNIT = 5              # 초봉 단위 (1, 3, 5, 10, 30, 60 중 선택)
