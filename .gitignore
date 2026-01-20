@@ -47,3 +47,5 @@ Thumbs.db
 .idea/
 *.swp
 logs/
+crypto_dashboard.py
+run_dashboard.sh

@@ -49,6 +49,7 @@ BTC_MARKET = "KRW-BTC"              # 비트코인 마켓 (시장 중심 지표)
 BTC_TREND_THRESHOLD = -0.005        # BTC 하락 임계값 (-0.5% 이하면 시장 위험)
 BTC_BULLISH_THRESHOLD = 0.003       # BTC 상승 임계값 (+0.3% 이상이면 시장 안정)
 BTC_CHECK_INTERVAL = 60             # BTC 추세 체크 주기 (초)
+BTC_DOWNTREND_BUY_BLOCK = False      # BTC 하락 시 매수 금지 (True: 적용, False: 미적용)
 
 # === 거시적 분석 (Macro Analysis) - 전체 시장 추세 ===
 MACRO_LOOKBACK_DAYS = 7             # 일봉 분석 기간 (일)
@@ -89,7 +90,7 @@ MIN_PRICE_STABILITY = 0.008         # 최소 가격 안정성 (급등락 필터)
 # === 시스템 설정 ===
 # MARKET: 빈 배열([]) 이면 거래대금 상위 TOP_MARKET_COUNT개 자동 선정
 #         지정된 마켓이 있으면 해당 마켓만 트레이딩
-MARKET = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]  # 빈 배열: 자동 선정, 예: ["KRW-BTC", "KRW-ETH"]
+MARKET = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-AXS" ]  # 빈 배열: 자동 선정, 예: ["KRW-BTC", "KRW-ETH"]
 MARKET_UPDATE_INTERVAL = 600        # 마켓 목록 갱신 주기 (10분) - 자동 모드에서만 사용
 TOP_MARKET_COUNT = 20               # 거래대금 상위 20개 선정 (집중도 상향)
 CANDLE_UNIT = 1                     # 분봉 단위 (1분)
@@ -421,7 +422,7 @@ class TradingState:
 
 
 class MarketAnalyzer:
-    """시장 분석기"""
+    """시장 분석기 - 전문가 관점의 종합 분석"""
     
     def __init__(self, api: UpbitAPI, market: str):
         self.api = api
@@ -430,19 +431,44 @@ class MarketAnalyzer:
         self.macro_score = 0.0            # 거시 점수
         self.last_macro_update = None     # 마지막 거시 분석 시간
         
-        # 캔들 데이터 캐시
-        self.minute_candles = deque(maxlen=200)
-        self.second_candles = deque(maxlen=120)  # 초봉 캐시 (최근 2분)
-        self.volume_history = deque(maxlen=100)
+        # 캔들 데이터 캐시 (다양한 시간대)
+        self.minute_candles = deque(maxlen=200)      # 1분봉
+        self.minute5_candles = deque(maxlen=100)     # 5분봉
+        self.minute15_candles = deque(maxlen=50)     # 15분봉
+        self.second_candles = deque(maxlen=120)      # 초봉 캐시 (최근 2분)
         self.volume_history = deque(maxlen=100)
         self.second_volume_history = deque(maxlen=60)
         
-        # 호가 데이터 (매수/매도 잔량 합계)
+        # ==== 체결 데이터 (Trade) - 매수/매도 세력 분석 ====
+        self.recent_trades = deque(maxlen=500)        # 최근 체결 내역
+        self.bid_volume_1m = 0.0                      # 최근 1분간 매수 체결량
+        self.ask_volume_1m = 0.0                      # 최근 1분간 매도 체결량
+        self.bid_volume_5m = 0.0                      # 최근 5분간 매수 체결량
+        self.ask_volume_5m = 0.0                      # 최근 5분간 매도 체결량
+        self.trade_count_1m = {'bid': 0, 'ask': 0}    # 최근 1분간 체결 건수
+        self.last_trade_update = None
+        
+        # ==== 가격 피로도/심리 지표 ====
+        self.price_history = deque(maxlen=300)        # 가격 히스토리 (5분간)
+        self.volatility = 0.0                         # 현재 변동성 (표준편차)
+        self.rsi_value = 50.0                         # RSI 유사 지표 (0-100)
+        self.fatigue_score = 0.0                      # 급등 피로도 (0-100, 높을수록 조정 가능성)
+        self.momentum_exhaustion = False              # 모멘텀 소진 여부
+        
+        # ==== 호가 데이터 (매수/매도 벽 분석) ====
         self.orderbook = {
             'total_ask_size': 0.0,
             'total_bid_size': 0.0,
-            'units': []
+            'units': [],
+            'spread': 0.0,                 # 스프레드 (매도호가 - 매수호가)
+            'spread_rate': 0.0,            # 스프레드 비율
+            'bid_depth_ratio': 0.0,        # 매수벽 깊이 비율
+            'imbalance': 0.0,              # 호가 불균형 (-1 ~ 1, 양수면 매수 우위)
         }
+        
+        # ==== 종합 시장 심리 ====
+        self.market_sentiment = 'neutral'  # bullish/bearish/neutral
+        self.sentiment_score = 50.0        # 시장 심리 점수 (0-100)
         
     def analyze_macro(self) -> Dict:
         """시장 추세 분석 (초단기/중단기/거시 하이브리드)"""
@@ -524,7 +550,7 @@ class MarketAnalyzer:
             self.second_volume_history.append(candle['candle_acc_trade_volume'])
             
     def update_candle_from_ws(self, data: Dict, type_key: str):
-        """WebSocket 캔들 데이터 업데이트"""
+        """WebSocket 캔들 데이터 업데이트 - 다양한 시간대 지원"""
         # WS 데이터 포맷을 REST API 포맷으로 변환
         candle = {
             'market': data.get('code') or data.get('cd'),
@@ -536,30 +562,42 @@ class MarketAnalyzer:
             'candle_acc_trade_volume': data.get('candle_acc_trade_volume') or data.get('catv'),
         }
         
-        if type_key == 'candle.1m':
-            # 마지막 캔들이 업데이트 된 것이면 교체, 새로운 분이면 추가
+        # 1분봉 (candle.minute.1 또는 candle.1m)
+        if type_key in ['candle.minute.1', 'candle.1m']:
             if self.minute_candles and self.minute_candles[-1]['candle_date_time_kst'] == candle['candle_date_time_kst']:
                 self.minute_candles[-1] = candle
-                # Volume history도 업데이트 필요
                 if self.volume_history:
                     self.volume_history[-1] = candle['candle_acc_trade_volume']
             else:
                 self.minute_candles.append(candle)
                 self.volume_history.append(candle['candle_acc_trade_volume'])
+        
+        # 5분봉
+        elif type_key == 'candle.minute.5':
+            if self.minute5_candles and self.minute5_candles[-1]['candle_date_time_kst'] == candle['candle_date_time_kst']:
+                self.minute5_candles[-1] = candle
+            else:
+                self.minute5_candles.append(candle)
+        
+        # 15분봉
+        elif type_key == 'candle.minute.15':
+            if self.minute15_candles and self.minute15_candles[-1]['candle_date_time_kst'] == candle['candle_date_time_kst']:
+                self.minute15_candles[-1] = candle
+            else:
+                self.minute15_candles.append(candle)
                 
-        elif type_key == 'candle.1s':
-            # 초봉 캐시 업데이트
-             if self.second_candles and self.second_candles[-1]['candle_date_time_kst'] == candle['candle_date_time_kst']:
+        # 초봉 (candle.second.1 또는 candle.1s)
+        elif type_key in ['candle.second.1', 'candle.1s']:
+            if self.second_candles and self.second_candles[-1]['candle_date_time_kst'] == candle['candle_date_time_kst']:
                 self.second_candles[-1] = candle
                 if self.second_volume_history:
                     self.second_volume_history[-1] = candle['candle_acc_trade_volume']
-             else:
+            else:
                 self.second_candles.append(candle)
-                self.second_volume_history.append(candle['candle_acc_trade_volume'])
     
     
     def update_orderbook_from_ws(self, data: Dict):
-        """호가 데이터 업데이트"""
+        """호가 데이터 업데이트 - 스프레드 및 불균형 분석 포함"""
         self.orderbook['total_ask_size'] = data.get('total_ask_size') or data.get('tas', 0.0)
         self.orderbook['total_bid_size'] = data.get('total_bid_size') or data.get('tbs', 0.0)
         
@@ -575,6 +613,259 @@ class MarketAnalyzer:
                     'bid_size': u.get('bid_size') or u.get('bs'),
                 })
             self.orderbook['units'] = unit_list
+            
+            # 스프레드 계산 (최상위 호가 기준)
+            if unit_list:
+                best_ask = unit_list[0]['ask_price']
+                best_bid = unit_list[0]['bid_price']
+                if best_ask and best_bid:
+                    self.orderbook['spread'] = best_ask - best_bid
+                    self.orderbook['spread_rate'] = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
+            
+            # 호가 불균형 계산 (-1 ~ 1)
+            total_ask = self.orderbook['total_ask_size']
+            total_bid = self.orderbook['total_bid_size']
+            if total_ask + total_bid > 0:
+                self.orderbook['imbalance'] = (total_bid - total_ask) / (total_bid + total_ask)
+            
+            # 상위 5호가 매수벽 깊이 비율
+            if len(unit_list) >= 5:
+                top5_bid = sum(u['bid_size'] for u in unit_list[:5] if u['bid_size'])
+                top5_ask = sum(u['ask_size'] for u in unit_list[:5] if u['ask_size'])
+                if top5_ask > 0:
+                    self.orderbook['bid_depth_ratio'] = top5_bid / top5_ask
+    
+    def update_trade_from_ws(self, data: Dict):
+        """체결 데이터 업데이트 - 매수/매도 세력 분석"""
+        trade = {
+            'timestamp': data.get('trade_timestamp') or data.get('ttms', 0),
+            'price': data.get('trade_price') or data.get('tp', 0),
+            'volume': data.get('trade_volume') or data.get('tv', 0),
+            'ask_bid': data.get('ask_bid') or data.get('ab', 'BID'),  # BID: 매수체결, ASK: 매도체결
+            'sequential_id': data.get('sequential_id') or data.get('sid', 0),
+        }
+        
+        self.recent_trades.append(trade)
+        self.last_trade_update = datetime.now()
+        
+        # 가격 히스토리 업데이트 (RSI 및 변동성 계산용)
+        self.price_history.append({
+            'price': trade['price'],
+            'timestamp': trade['timestamp']
+        })
+        
+        # 1분간, 5분간 체결량 집계 업데이트
+        self._update_volume_aggregates()
+        
+        # RSI 및 피로도 업데이트
+        self._update_technical_indicators()
+    
+    def _update_volume_aggregates(self):
+        """체결량 집계 업데이트 (1분/5분)"""
+        now_ts = datetime.now().timestamp() * 1000  # 밀리초
+        one_min_ago = now_ts - 60 * 1000
+        five_min_ago = now_ts - 5 * 60 * 1000
+        
+        bid_1m = ask_1m = 0.0
+        bid_5m = ask_5m = 0.0
+        bid_count = ask_count = 0
+        
+        for trade in self.recent_trades:
+            ts = trade['timestamp']
+            vol = trade['volume']
+            is_bid = trade['ask_bid'] == 'BID'
+            
+            if ts >= one_min_ago:
+                if is_bid:
+                    bid_1m += vol
+                    bid_count += 1
+                else:
+                    ask_1m += vol
+                    ask_count += 1
+            
+            if ts >= five_min_ago:
+                if is_bid:
+                    bid_5m += vol
+                else:
+                    ask_5m += vol
+        
+        self.bid_volume_1m = bid_1m
+        self.ask_volume_1m = ask_1m
+        self.bid_volume_5m = bid_5m
+        self.ask_volume_5m = ask_5m
+        self.trade_count_1m = {'bid': bid_count, 'ask': ask_count}
+    
+    def _update_technical_indicators(self):
+        """RSI, 변동성, 피로도 등 기술 지표 업데이트"""
+        if len(self.price_history) < 14:
+            return
+        
+        prices = [p['price'] for p in list(self.price_history)[-60:]]  # 최근 60틱
+        
+        # === RSI 계산 (14-period 유사 방식) ===
+        gains = []
+        losses = []
+        for i in range(1, min(15, len(prices))):
+            change = prices[-i] - prices[-i-1]
+            if change > 0:
+                gains.append(change)
+            else:
+                losses.append(abs(change))
+        
+        avg_gain = sum(gains) / 14 if gains else 0.0001
+        avg_loss = sum(losses) / 14 if losses else 0.0001
+        
+        if avg_loss > 0:
+            rs = avg_gain / avg_loss
+            self.rsi_value = 100 - (100 / (1 + rs))
+        else:
+            self.rsi_value = 100 if avg_gain > 0 else 50
+        
+        # === 변동성 계산 (표준편차) ===
+        if len(prices) >= 20:
+            import statistics
+            self.volatility = statistics.stdev(prices[-20:]) / statistics.mean(prices[-20:])
+        
+        # === 급등 피로도 계산 ===
+        self._update_fatigue_score(prices)
+    
+    def _update_fatigue_score(self, prices: List[float]):
+        """급등 피로도 계산 - 급등 후 조정 가능성 평가"""
+        if len(prices) < 30:
+            self.fatigue_score = 0
+            return
+        
+        current = prices[-1]
+        
+        # 5분 전 가격 대비 상승률
+        price_5m_ago = prices[-min(30, len(prices))]
+        change_5m = (current - price_5m_ago) / price_5m_ago if price_5m_ago > 0 else 0
+        
+        # 1. 급격한 상승률에 따른 피로도 (5% 이상 상승 시 높은 피로도)
+        rate_fatigue = min(100, abs(change_5m) * 1000)  # 1% = 10점
+        
+        # 2. RSI가 70 이상이면 과매수 → 피로도 증가
+        rsi_fatigue = 0
+        if self.rsi_value >= 70:
+            rsi_fatigue = (self.rsi_value - 70) * 3  # 70 초과분 * 3
+        elif self.rsi_value >= 80:
+            rsi_fatigue = 30 + (self.rsi_value - 80) * 5  # 더 가파르게
+        
+        # 3. 거래량 스파이크 후 급감하면 모멘텀 소진
+        volume_fatigue = 0
+        if len(self.minute_candles) >= 3:
+            recent_vols = [c['candle_acc_trade_volume'] for c in list(self.minute_candles)[-3:]]
+            if len(recent_vols) == 3:
+                # 이전 거래량 대비 현재 거래량이 급감하면 소진
+                if recent_vols[1] > 0 and recent_vols[2] / recent_vols[1] < 0.5:
+                    volume_fatigue = 20
+                    self.momentum_exhaustion = True
+                else:
+                    self.momentum_exhaustion = False
+        
+        # 4. 매도 우위 전환 감지
+        sell_pressure = 0
+        if self.bid_volume_1m + self.ask_volume_1m > 0:
+            sell_ratio = self.ask_volume_1m / (self.bid_volume_1m + self.ask_volume_1m)
+            if sell_ratio > 0.6:  # 60% 이상 매도체결
+                sell_pressure = (sell_ratio - 0.5) * 100
+        
+        # 종합 피로도
+        self.fatigue_score = min(100, rate_fatigue + rsi_fatigue + volume_fatigue + sell_pressure)
+    
+    def analyze_market_sentiment(self) -> Dict:
+        """종합 시장 심리 분석 - 전문가 관점"""
+        analysis = {
+            'sentiment': 'neutral',
+            'score': 50.0,
+            'buy_pressure': 0.0,
+            'sell_pressure': 0.0,
+            'fatigue': self.fatigue_score,
+            'volatility': self.volatility,
+            'rsi': self.rsi_value,
+            'orderbook_imbalance': self.orderbook.get('imbalance', 0),
+            'reasons': [],
+            'warnings': [],
+        }
+        
+        score = 50.0  # 중립 기준
+        
+        # === 1. 매수/매도 체결량 비율 분석 ===
+        total_vol_1m = self.bid_volume_1m + self.ask_volume_1m
+        if total_vol_1m > 0:
+            buy_ratio = self.bid_volume_1m / total_vol_1m
+            analysis['buy_pressure'] = buy_ratio
+            analysis['sell_pressure'] = 1 - buy_ratio
+            
+            if buy_ratio >= 0.65:
+                score += 15
+                analysis['reasons'].append(f"매수 체결 우위 ({buy_ratio*100:.1f}%)")
+            elif buy_ratio >= 0.55:
+                score += 8
+                analysis['reasons'].append(f"매수 소폭 우위 ({buy_ratio*100:.1f}%)")
+            elif buy_ratio <= 0.35:
+                score -= 15
+                analysis['warnings'].append(f"매도 체결 우위 ({(1-buy_ratio)*100:.1f}%)")
+            elif buy_ratio <= 0.45:
+                score -= 8
+                analysis['warnings'].append(f"매도 소폭 우위 ({(1-buy_ratio)*100:.1f}%)")
+        
+        # === 2. 호가창 불균형 분석 ===
+        imbalance = self.orderbook.get('imbalance', 0)
+        if imbalance >= 0.3:
+            score += 10
+            analysis['reasons'].append(f"매수벽 우위 (불균형:{imbalance:.2f})")
+        elif imbalance <= -0.3:
+            score -= 10
+            analysis['warnings'].append(f"매도벽 우위 (불균형:{imbalance:.2f})")
+        
+        # === 3. RSI 과매수/과매도 분석 ===
+        if self.rsi_value >= 80:
+            score -= 20
+            analysis['warnings'].append(f"🚨 극심한 과매수 (RSI:{self.rsi_value:.1f})")
+        elif self.rsi_value >= 70:
+            score -= 10
+            analysis['warnings'].append(f"⚠️ 과매수 구간 (RSI:{self.rsi_value:.1f})")
+        elif self.rsi_value <= 20:
+            score += 15
+            analysis['reasons'].append(f"과매도 반등 가능 (RSI:{self.rsi_value:.1f})")
+        elif self.rsi_value <= 30:
+            score += 8
+            analysis['reasons'].append(f"과매도 구간 (RSI:{self.rsi_value:.1f})")
+        
+        # === 4. 급등 피로도 분석 ===
+        if self.fatigue_score >= 60:
+            score -= 25
+            analysis['warnings'].append(f"🔥 급등 피로도 높음 ({self.fatigue_score:.1f}) - 조정 가능성")
+        elif self.fatigue_score >= 40:
+            score -= 12
+            analysis['warnings'].append(f"급등 피로감 ({self.fatigue_score:.1f})")
+        
+        # === 5. 모멘텀 소진 체크 ===
+        if self.momentum_exhaustion:
+            score -= 15
+            analysis['warnings'].append("📉 모멘텀 소진 - 거래량 급감")
+        
+        # === 6. 변동성 체크 ===
+        if self.volatility >= 0.02:  # 2% 이상 변동성
+            score -= 5
+            analysis['warnings'].append(f"높은 변동성 ({self.volatility*100:.2f}%)")
+        
+        # 최종 점수 및 심리 결정
+        score = max(0, min(100, score))
+        analysis['score'] = score
+        
+        if score >= 65:
+            analysis['sentiment'] = 'bullish'
+        elif score <= 35:
+            analysis['sentiment'] = 'bearish'
+        else:
+            analysis['sentiment'] = 'neutral'
+        
+        self.market_sentiment = analysis['sentiment']
+        self.sentiment_score = score
+        
+        return analysis
     
     def detect_momentum(self, current_price: float) -> Dict:
         """모멘텀 감지 (분봉 기반 - 가속도 및 수급 интенсив성 분석)"""
@@ -1006,7 +1297,8 @@ class MomentumTrader:
                 # 추세 판단
                 if btc_change <= BTC_TREND_THRESHOLD:
                     self.btc_trend = 'bearish'
-                    self.market_safe = False
+                    # BTC_DOWNTREND_BUY_BLOCK이 True일 때만 매수 금지
+                    self.market_safe = not BTC_DOWNTREND_BUY_BLOCK
                 elif btc_change >= BTC_BULLISH_THRESHOLD:
                     self.btc_trend = 'bullish'
                     self.market_safe = True
@@ -1019,8 +1311,9 @@ class MomentumTrader:
                 # 로그 출력
                 trend_emoji = "🟢" if self.btc_trend == 'bullish' else ("🔴" if self.btc_trend == 'bearish' else "🟡")
                 safe_status = "✅ 진입가능" if self.market_safe else "⛔ 진입중단"
+                block_status = "[BTC차단:ON]" if BTC_DOWNTREND_BUY_BLOCK else "[BTC차단:OFF]"
                 logger.info(f"[{BTC_MARKET}] {trend_emoji} BTC 추세: {self.btc_trend.upper()} | "
-                          f"1시간 변화: {Color.YELLOW}{btc_change*100:+.2f}%{Color.RESET} | {safe_status}")
+                          f"1시간 변화: {Color.YELLOW}{btc_change*100:+.2f}%{Color.RESET} | {safe_status} {block_status}")
                 
         except Exception as e:
             logger.error(f"BTC 추세 확인 오류: {e}")
@@ -1115,23 +1408,24 @@ class MomentumTrader:
         while self.running:
             try:
                 async with websockets.connect(WS_PUBLIC_URL) as ws:
-                    # 구독 요청
-                    # 모든 마켓 구독
+                    # 구독 요청 - 다양한 시간대의 캔들 및 체결 데이터
                     codes = self.markets
                     subscribe = [
                         {"ticket": f"momentum-pub-{uuid.uuid4()}"},
                         {"type": "ticker", "codes": codes},
-                        {"type": "trade", "codes": codes},
-                        {"type": "orderbook", "codes": codes}, # 호가 구독
-                        {"type": "candle.1m", "codes": codes},
+                        {"type": "trade", "codes": codes},           # 체결 데이터 (매수/매도 구분)
+                        {"type": "orderbook", "codes": codes},       # 호가 데이터
+                        {"type": "candle.minute.1", "codes": codes}, # 1분봉
+                        {"type": "candle.minute.5", "codes": codes}, # 5분봉 추가
+                        {"type": "candle.minute.15", "codes": codes},# 15분봉 추가
                         {"format": "DEFAULT"}
                     ]
                     
                     if USE_SECOND_CANDLES:
-                         subscribe.insert(4, {"type": "candle.1s", "codes": codes}) 
+                         subscribe.insert(4, {"type": "candle.second.1", "codes": codes}) 
                     
                     await ws.send(json.dumps(subscribe))
-                    logger.info(f"📡 Public WebSocket 연결됨 ({len(codes)}개 마켓)")
+                    logger.info(f"📡 Public WebSocket 연결됨 ({len(codes)}개 마켓) - 1분/5분/15분봉 + 체결 + 호가")
                     
                     # PING 타이머
                     last_ping = time.time()
@@ -1165,10 +1459,14 @@ class MomentumTrader:
                                     self.last_price_updates[code] = datetime.now()
                                     
                                 elif type_val == 'trade':
-                                    self.current_prices[code] = data.get('trade_price', self.current_prices.get(code, 0))
+                                    # 체결 데이터 - 가격 업데이트 + 매수/매도 세력 분석
+                                    self.current_prices[code] = data.get('trade_price') or data.get('tp', self.current_prices.get(code, 0))
                                     self.last_price_updates[code] = datetime.now()
+                                    # 체결 데이터를 Analyzer에 전달 (매수/매도 분석용)
+                                    self.analyzers[code].update_trade_from_ws(data)
                                 
-                                elif type_val == 'candle.1m' or type_val == 'candle.1s':
+                                elif type_val.startswith('candle.'):
+                                    # 캔들 데이터 (1분/5분/15분/초봉)
                                     self.analyzers[code].update_candle_from_ws(data, type_val)
                                     
                                 elif type_val == 'orderbook':
@@ -1323,9 +1621,21 @@ class MomentumTrader:
                         vol_ratio = min_result.get('volume_ratio', 0)
                         sec_change = sec_result.get('price_change', 0) * 100 if sec_result else 0
                         
+                        # 심리 분석 정보 추가
+                        rsi = analyzer.rsi_value
+                        fatigue = analyzer.fatigue_score
+                        sentiment = analyzer.market_sentiment
+                        
+                        # 매수/매도 비율
+                        total_vol = analyzer.bid_volume_1m + analyzer.ask_volume_1m
+                        buy_ratio = analyzer.bid_volume_1m / total_vol * 100 if total_vol > 0 else 50
+                        
+                        sentiment_emoji = "🟢" if sentiment == 'bullish' else ("🔴" if sentiment == 'bearish' else "🟡")
+                        
                         logger.info(f"[{market}] 📊 {price:,.0f}원 | "
-                                  f"분봉:{min_change:+.2f}% 초봉:{sec_change:+.3f}% | "
-                                  f"거래량:{vol_ratio:.1f}배 | 강도:{min_result['strength']:.0f}")
+                                  f"분봉:{min_change:+.2f}% | "
+                                  f"RSI:{rsi:.0f} 피로:{fatigue:.0f} | "
+                                  f"매수:{buy_ratio:.0f}% | {sentiment_emoji}{sentiment}")
                 
                 await asyncio.sleep(1)  # 1초마다 체크
                 
@@ -1345,7 +1655,7 @@ class MomentumTrader:
                 logger.error(f"거시 분석 업데이트 오류: {e}")
     
     async def _find_entry(self, market: str):
-        """진입 기회 탐색 (분봉 + 초봉 결합 분석)"""
+        """진입 기회 탐색 - 전문가 관점의 종합 분석"""
         state = self.states[market]
         if not state.can_trade():
             return
@@ -1354,7 +1664,6 @@ class MomentumTrader:
         current_price = self.current_prices[market]
         
         try:
-            # REST API 호출 제거하고 캐시된 캔들 사용 (WebSocket으로 업데이트됨)
             # 캔들 데이터 부족하면 대기
             if len(analyzer.minute_candles) < MOMENTUM_WINDOW:
                 logger.debug(f"[{market}] 캔들 데이터 수집 중... ({len(analyzer.minute_candles)}/{MOMENTUM_WINDOW})")
@@ -1363,14 +1672,59 @@ class MomentumTrader:
             if USE_SECOND_CANDLES and len(analyzer.second_candles) < SECOND_MOMENTUM_WINDOW:
                  return
             
-            # 결합 모멘텀 감지 (분봉 + 초봉)
+            # ==== 1단계: 종합 시장 심리 분석 (전문가 관점) ====
+            sentiment = analyzer.analyze_market_sentiment()
+            
+            # 강력한 매도 우위/피로도 높음 → 진입 차단
+            if sentiment['sentiment'] == 'bearish':
+                # 상세 경고 로그 (10초에 1번만)
+                if int(time.time()) % 10 == 0:
+                    warnings = ' | '.join(sentiment.get('warnings', []))
+                    logger.debug(f"[{market}] 🚫 진입 차단 - 부정적 심리 (점수:{sentiment['score']:.0f})")
+                    if warnings:
+                        logger.debug(f"   경고: {warnings}")
+                return
+            
+            # 피로도가 높으면 신중하게 접근 (진입 조건 강화)
+            high_fatigue = sentiment['fatigue'] >= 40
+            overbought = sentiment['rsi'] >= 70
+            
+            # ==== 2단계: 모멘텀 감지 (분봉 + 초봉) ====
             momentum = analyzer.detect_combined_momentum(current_price)
             
-            if momentum['signal']:
-                rapid_indicator = "🚀" if momentum.get('rapid_rise') else "🎯"
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] {rapid_indicator} 진입 신호 감지! | {momentum['reason']} | "
-                          f"강도: {Color.MAGENTA}{momentum['strength']:.1f}{Color.RESET}")
-                await self._execute_buy(market)
+            if not momentum['signal']:
+                return
+            
+            # ==== 3단계: 피로도/과매수 시 추가 필터링 ====
+            if high_fatigue or overbought:
+                # 피로도 높거나 과매수이면, 더 강력한 신호만 허용
+                if momentum['strength'] < 70:
+                    if int(time.time()) % 15 == 0:
+                        logger.info(f"[{market}] ⚠️ 신호 감지되었으나 피로도/과매수로 신중 대기 | "
+                                  f"피로도:{sentiment['fatigue']:.0f} RSI:{sentiment['rsi']:.0f} 강도:{momentum['strength']:.0f}")
+                    return
+                
+                # 매도 우위라면 진입 차단
+                if sentiment['sell_pressure'] > 0.55:
+                    logger.info(f"[{market}] ⚠️ 매도 우위 전환 감지 - 진입 보류 (매도비율:{sentiment['sell_pressure']*100:.1f}%)")
+                    return
+            
+            # ==== 4단계: 모멘텀 소진 체크 ====
+            if analyzer.momentum_exhaustion:
+                logger.info(f"[{market}] 📉 모멘텀 소진 - 거래량 급감으로 진입 보류")
+                return
+            
+            # ==== 최종: 진입 신호 확정 ====
+            rapid_indicator = "🚀" if momentum.get('rapid_rise') else "🎯"
+            sentiment_info = f"심리:{sentiment['sentiment']}({sentiment['score']:.0f})"
+            trade_ratio_info = f"매수:{sentiment['buy_pressure']*100:.0f}%/매도:{sentiment['sell_pressure']*100:.0f}%"
+            
+            logger.info(f"[{Color.BOLD}{market}{Color.RESET}] {rapid_indicator} 진입 신호 확정!")
+            logger.info(f"   {momentum['reason']}")
+            logger.info(f"   강도:{Color.MAGENTA}{momentum['strength']:.1f}{Color.RESET} | {sentiment_info} | {trade_ratio_info}")
+            logger.info(f"   RSI:{sentiment['rsi']:.1f} | 피로도:{sentiment['fatigue']:.1f} | 호가불균형:{sentiment['orderbook_imbalance']:.2f}")
+            
+            await self._execute_buy(market)
                 
         except Exception as e:
             logger.error(f"[{market}] 진입 탐색 오류: {e}")
