@@ -34,14 +34,31 @@ import jwt
 import requests
 import websockets
 from dotenv import load_dotenv
+import redis
+
+class RedisLogHandler(logging.Handler):
+    def __init__(self, redis_client, channel="[MON]:LOGS"):
+        super().__init__()
+        self.redis_client = redis_client
+        self.channel = channel
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            if self.redis_client:
+                self.redis_client.publish(self.channel, msg)
+        except Exception:
+            self.handleError(record)
 
 # =================================================================================
 # 📊 전략 파라미터 (Strategy Parameters) - 여기서 조절 가능
 # =================================================================================
 
 # === 투자 설정 ===
-MAX_INVESTMENT = 10_000_000         # 최대 투자금 (원) - 1천만원으로 상향
+MAX_INVESTMENT = 1000000         # 최대 투자금 (원) - 1천만원으로 상향
 MIN_ORDER_AMOUNT = 5_000            # 최소 주문 금액 (업비트 최소금액 5,000원 + 버퍼)
+TRADING_FEE_RATE = 0.0005           # 거래 수수료 (0.05% = 0.0005)
+REDIS_PASSWORD = "zC0ZQOY0oJPz/NQ/tqTkpG1OEEXHCx5gJrTLFCg1rlw="
 TRADING_FEE_RATE = 0.0005           # 거래 수수료 (0.05% = 0.0005)
 
 # === BTC 중심 시장 분석 (BTC-Centric Market Analysis) ===
@@ -75,6 +92,16 @@ SHORT_MOMENTUM_THRESHOLD = 0.008    # 단기 급반등 기준 (20분 내 0.8% �
 VOL_INTENSITY_THRESHOLD = 2.5       # 수급 집중도 (평균 대비 2.5배 이상)
 BREAKOUT_VELOCITY = 0.0015          # 분당 가격 가속도 (0.15%/min) - 강화
 
+# === 다중 타임프레임 분석 (Multi-Timeframe Analysis) - 핵심 개선 ===
+MTF_ENABLED = True                  # 다중 타임프레임 분석 활성화
+MTF_5M_MIN_CANDLES = 5              # 5분봉 최소 필요 개수
+MTF_15M_MIN_CANDLES = 3             # 15분봉 최소 필요 개수
+MTF_5M_TREND_THRESHOLD = 0.002      # 5분봉 상승 추세 기준 (0.2%)
+MTF_15M_TREND_THRESHOLD = 0.001     # 15분봉 상승/횡보 기준 (0.1%, 하락이 아니면 OK)
+MTF_5M_EARLY_STAGE_MAX = 0.025      # 5분봉 상승 초기 단계 최대치 (2.5% 이하여야 초기)
+MTF_VOLUME_CONFIRMATION = 1.5       # 5분봉 거래량 확인 배율 (평균 대비)
+MTF_STRICT_MODE = True              # 엄격 모드 (15분봉 하락 시 무조건 차단)
+
 # === 익절/손절 설정 ===
 INITIAL_STOP_LOSS = 0.02            # 초기 손절선 (2%) - 변동성 고려 완화
 TRAILING_STOP_ACTIVATION = 0.015    # 트레일링 스탑 활성화 기준 (+1.5% 수익 시)
@@ -90,7 +117,8 @@ MIN_PRICE_STABILITY = 0.008         # 최소 가격 안정성 (급등락 필터)
 # === 시스템 설정 ===
 # MARKET: 빈 배열([]) 이면 거래대금 상위 TOP_MARKET_COUNT개 자동 선정
 #         지정된 마켓이 있으면 해당 마켓만 트레이딩
-MARKET = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-AXS" ]  # 빈 배열: 자동 선정, 예: ["KRW-BTC", "KRW-ETH"]
+# MARKET = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-AXS" ]  # 빈 배열: 자동 선정, 예: ["KRW-BTC", "KRW-ETH"]
+MARKET = [] 
 MARKET_UPDATE_INTERVAL = 600        # 마켓 목록 갱신 주기 (10분) - 자동 모드에서만 사용
 TOP_MARKET_COUNT = 20               # 거래대금 상위 20개 선정 (집중도 상향)
 CANDLE_UNIT = 1                     # 분봉 단위 (1분)
@@ -229,6 +257,7 @@ class UpbitAPI:
                 # 429가 아닌 다른 오류나 마지막 재시도 실패 시
                 if attempt == 3 or (hasattr(e, 'response') and e.response is not None and e.response.status_code != 429):
                     logger.error(f"API 요청 실패: {e}")
+                    logger.error(f"요청 정보: endpoint={endpoint}, params={params}, data={data}")
                     if hasattr(e, 'response') and e.response:
                          logger.error(f"응답: {e.response.text}")
                     raise
@@ -878,6 +907,119 @@ class MarketAnalyzer:
         
         return analysis
     
+    def analyze_multi_timeframe(self, current_price: float) -> Dict:
+        """다중 타임프레임 분석 - 5분봉/15분봉으로 진입 타이밍 검증
+        
+        핵심 목표:
+        1. 상승 '초기' 단계인지 확인 (고점 추격 방지)
+        2. 중기 추세(15분봉)가 하락이 아닌지 확인
+        3. 5분봉 거래량을 통해 수급 확인
+        """
+        result = {
+            'valid_entry': True,  # 진입 허용 여부
+            'stage': 'unknown',   # early(초기), mid(중반), late(후반), exhausted(소진)
+            'trend_5m': 'neutral',
+            'trend_15m': 'neutral',
+            'change_5m': 0.0,
+            'change_15m': 0.0,
+            'volume_confirmed': False,
+            'reasons': [],
+            'warnings': [],
+        }
+        
+        # MTF 비활성화 시 항상 허용
+        if not MTF_ENABLED:
+            result['reasons'].append("MTF 분석 비활성화")
+            return result
+        
+        # === 1. 5분봉 분석 ===
+        if len(self.minute5_candles) >= MTF_5M_MIN_CANDLES:
+            candles_5m = list(self.minute5_candles)[-MTF_5M_MIN_CANDLES:]
+            
+            # 5분봉 전체 변화율 (시작 ~ 현재)
+            start_price = candles_5m[0]['opening_price']
+            change_5m = (current_price - start_price) / start_price if start_price > 0 else 0
+            result['change_5m'] = change_5m
+            
+            # 최근 5분봉 2개의 추세
+            recent_5m_change = (candles_5m[-1]['trade_price'] - candles_5m[-2]['trade_price']) / candles_5m[-2]['trade_price'] if candles_5m[-2]['trade_price'] > 0 else 0
+            
+            # 5분봉 추세 판단
+            if change_5m >= MTF_5M_TREND_THRESHOLD and recent_5m_change >= 0:
+                result['trend_5m'] = 'bullish'
+                result['reasons'].append(f"5분봉 상승 추세 ({change_5m*100:.2f}%)")
+            elif change_5m <= -MTF_5M_TREND_THRESHOLD:
+                result['trend_5m'] = 'bearish'
+                result['warnings'].append(f"5분봉 하락 추세 ({change_5m*100:.2f}%)")
+            else:
+                result['trend_5m'] = 'neutral'
+            
+            # 상승 단계 판단 (핵심!)
+            if change_5m >= MTF_5M_EARLY_STAGE_MAX:
+                # 이미 2.5% 이상 상승 = 후반/소진 단계
+                result['stage'] = 'late'
+                result['warnings'].append(f"⚠️ 상승 후반 ({change_5m*100:.2f}%) - 고점 추격 위험")
+                result['valid_entry'] = False
+            elif change_5m >= MTF_5M_TREND_THRESHOLD:
+                # 0.2% ~ 2.5% 상승 = 초기~중반
+                if change_5m <= 0.01:  # 1% 이하
+                    result['stage'] = 'early'
+                    result['reasons'].append(f"✅ 상승 초기 ({change_5m*100:.2f}%)")
+                else:
+                    result['stage'] = 'mid'
+                    result['reasons'].append(f"📈 상승 중반 ({change_5m*100:.2f}%)")
+            else:
+                result['stage'] = 'neutral'
+            
+            # 5분봉 거래량 확인
+            if len(candles_5m) >= 3:
+                avg_vol = sum(c['candle_acc_trade_volume'] for c in candles_5m[:-1]) / (len(candles_5m) - 1)
+                current_vol = candles_5m[-1]['candle_acc_trade_volume']
+                if avg_vol > 0 and current_vol >= avg_vol * MTF_VOLUME_CONFIRMATION:
+                    result['volume_confirmed'] = True
+                    result['reasons'].append(f"거래량 확인 ({current_vol/avg_vol:.1f}x)")
+                elif avg_vol > 0 and current_vol < avg_vol * 0.7:
+                    result['warnings'].append(f"거래량 감소 ({current_vol/avg_vol:.1f}x)")
+        else:
+            result['warnings'].append(f"5분봉 데이터 부족 ({len(self.minute5_candles)}/{MTF_5M_MIN_CANDLES})")
+        
+        # === 2. 15분봉 분석 ===
+        if len(self.minute15_candles) >= MTF_15M_MIN_CANDLES:
+            candles_15m = list(self.minute15_candles)[-MTF_15M_MIN_CANDLES:]
+            
+            # 15분봉 전체 변화율
+            start_price_15m = candles_15m[0]['opening_price']
+            change_15m = (current_price - start_price_15m) / start_price_15m if start_price_15m > 0 else 0
+            result['change_15m'] = change_15m
+            
+            # 15분봉 추세 판단
+            if change_15m >= MTF_15M_TREND_THRESHOLD:
+                result['trend_15m'] = 'bullish'
+                result['reasons'].append(f"15분봉 상승 ({change_15m*100:.2f}%)")
+            elif change_15m <= -MTF_15M_TREND_THRESHOLD:
+                result['trend_15m'] = 'bearish'
+                result['warnings'].append(f"🚫 15분봉 하락 ({change_15m*100:.2f}%)")
+                if MTF_STRICT_MODE:
+                    result['valid_entry'] = False
+            else:
+                result['trend_15m'] = 'neutral'
+                result['reasons'].append(f"15분봉 횡보 ({change_15m*100:.2f}%)")
+        else:
+            result['warnings'].append(f"15분봉 데이터 부족 ({len(self.minute15_candles)}/{MTF_15M_MIN_CANDLES})")
+        
+        # === 3. 추가 필터: 직전 캔들 음봉 연속 체크 ===
+        if len(self.minute5_candles) >= 3:
+            recent_3 = list(self.minute5_candles)[-3:]
+            down_count = sum(1 for c in recent_3 if c['trade_price'] < c['opening_price'])
+            if down_count >= 2:
+                result['warnings'].append(f"최근 5분봉 {down_count}개 음봉")
+                if down_count == 3:
+                    result['valid_entry'] = False
+                    result['warnings'].append("🚫 3연속 음봉 - 진입 차단")
+        
+        return result
+
+    
     def detect_momentum(self, current_price: float) -> Dict:
         """모멘텀 감지 (분봉 기반 - 가속도 및 수급 интенсив성 분석)"""
         if len(self.minute_candles) < MOMENTUM_WINDOW:
@@ -1015,14 +1157,23 @@ class MarketAnalyzer:
         }
     
     def detect_combined_momentum(self, current_price: float) -> Dict:
-        """분봉 + 초봉 결합 모멘텀 감지"""
+        """분봉 + 초봉 + 다중 타임프레임(5분/15분) 결합 모멘텀 감지
+        
+        개선된 진입 로직:
+        1. 1분봉/초봉으로 모멘텀 신호 감지
+        2. 5분봉/15분봉으로 상승 초기 단계인지 확인
+        3. 고점 추격 방지 (상승 후반/소진 단계 진입 차단)
+        """
         minute_result = self.detect_momentum(current_price)
         
-        # 초봉 사용 안함이면 분봉만 반환
+        # 초봉 사용 안함이면 분봉만 사용, MTF는 별도 처리
         if not USE_SECOND_CANDLES or len(self.second_candles) < SECOND_MOMENTUM_WINDOW:
-            return minute_result
+            second_result = {'signal': False, 'strength': 0, 'rapid_rise': False, 'reason': '초봉 미사용'}
+        else:
+            second_result = self.detect_second_momentum(current_price)
         
-        second_result = self.detect_second_momentum(current_price)
+        # === 다중 타임프레임 분석 (핵심 개선) ===
+        mtf_result = self.analyze_multi_timeframe(current_price)
         
         # 분봉 기본조건 + 초봉 확인으로 정밀도 향상
         # 케이스 1: 분봉 신호 O + 초봉 확인 = 강력한 신호
@@ -1031,15 +1182,17 @@ class MarketAnalyzer:
         combined_signal = False
         combined_strength = 0
         reasons = []
+        mtf_blocked = False
         
-        if minute_result['signal'] and second_result['signal']:
+        # === 1단계: 기존 1분봉/초봉 신호 확인 ===
+        if minute_result['signal'] and second_result.get('signal', False):
             # 둘 다 신호: 매우 강력
             combined_signal = True
             combined_strength = min(100, minute_result['strength'] * 0.6 + second_result['strength'] * 0.4)
             reasons.append(minute_result['reason'])
             reasons.append(second_result['reason'])
             
-        elif second_result['rapid_rise']:
+        elif second_result.get('rapid_rise', False):
             # 초봉 급등만 감지: 빠른 진입 (분봉 조건 완화)
             if minute_result['price_change'] > MOMENTUM_THRESHOLD * 0.8:  # 분봉 조건 80% 충족 필요 (기준 강화)
                 combined_signal = True
@@ -1052,12 +1205,52 @@ class MarketAnalyzer:
             combined_strength = minute_result['strength'] * 0.8
             reasons.append(minute_result['reason'])
         
+        # === 2단계: MTF 필터 적용 (핵심!) ===
+        if combined_signal and MTF_ENABLED:
+            # MTF 분석 결과에 따른 진입 차단/허용
+            if not mtf_result['valid_entry']:
+                combined_signal = False
+                mtf_blocked = True
+                reasons.append(f"🚫 MTF 차단: {' | '.join(mtf_result['warnings'])}")
+            else:
+                # 상승 단계에 따른 강도 조정
+                stage = mtf_result.get('stage', 'unknown')
+                if stage == 'early':
+                    combined_strength = min(100, combined_strength * 1.2)  # 초기 단계 보너스
+                    reasons.append(f"🎯 상승초기 진입")
+                elif stage == 'mid':
+                    combined_strength = combined_strength * 0.9  # 중반은 약간 할인
+                    reasons.append(f"📈 상승중반")
+                elif stage == 'late':
+                    combined_signal = False  # 후반 진입 차단
+                    mtf_blocked = True
+                    reasons.append(f"🚫 상승후반 - 진입차단")
+                
+                # 거래량 확인 보너스
+                if mtf_result['volume_confirmed']:
+                    combined_strength = min(100, combined_strength + 10)
+                
+                # 15분봉 추세 보너스/패널티
+                if mtf_result['trend_15m'] == 'bullish':
+                    combined_strength = min(100, combined_strength + 5)
+                elif mtf_result['trend_15m'] == 'bearish':
+                    combined_strength = max(0, combined_strength - 15)
+                    if MTF_STRICT_MODE:
+                        combined_signal = False
+                        mtf_blocked = True
+                        reasons.append(f"🚫 15분봉 하락추세")
+        
         return {
             'signal': combined_signal,
             'strength': combined_strength,
             'minute_signal': minute_result['signal'],
-            'second_signal': second_result['signal'],
+            'second_signal': second_result.get('signal', False),
             'rapid_rise': second_result.get('rapid_rise', False),
+            'mtf_valid': mtf_result['valid_entry'],
+            'mtf_stage': mtf_result.get('stage', 'unknown'),
+            'mtf_trend_5m': mtf_result.get('trend_5m', 'neutral'),
+            'mtf_trend_15m': mtf_result.get('trend_15m', 'neutral'),
+            'mtf_blocked': mtf_blocked,
             'reason': ' | '.join(reasons) if reasons else '조건 미충족'
         }
 
@@ -1069,6 +1262,20 @@ class MomentumTrader:
         self.access_key = ACCESS_KEY
         self.secret_key = SECRET_KEY
         self.api = UpbitAPI(ACCESS_KEY, SECRET_KEY)
+        
+        # Redis 초기화
+        try:
+            self.redis = redis.Redis(host='localhost', port=6379, db=0, password=REDIS_PASSWORD, decode_responses=True)
+            self.redis.ping()
+            logger.info("✅ Redis 연결 성공")
+            
+            # Redis Log Handler 추가
+            redis_handler = RedisLogHandler(self.redis)
+            redis_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+            logging.getLogger().addHandler(redis_handler)
+        except Exception as e:
+            logger.error(f"Redis 연결 실패: {e}")
+            self.redis = None
         
         # 동적 관리
         self.markets = []  
@@ -1123,7 +1330,7 @@ class MomentumTrader:
         # 파일이 없으면 헤더 작성
         if not os.path.exists(TRADE_LOG_FILE):
             with open(TRADE_LOG_FILE, 'w', encoding='utf-8') as f:
-                f.write("timestamp,market,type,price,amount,volume,profit,profit_rate,cumulative_profit,reason\n")
+                f.write("timestamp,market,type,price,trade_value,volume,profit,profit_rate,cumulative_profit,reason\n")
             logger.info(f"📝 거래 로그 파일 생성: {TRADE_LOG_FILE}")
     
     def _log_trade(self, market: str, trade_type: str, price: float, amount: float, 
@@ -1378,14 +1585,77 @@ class MomentumTrader:
             except Exception as e:
                 logger.error(f"리포트 루프 오류: {e}")
     
+    def _update_redis_ticker(self, market: str, price: float):
+        """Redis에 시세 정보 업데이트"""
+        if not self.redis: return
+        try:
+            key = f"[MON]:TICKER:{market}"
+            mapping = {
+                "price": str(price),
+                "timestamp": str(datetime.now())
+            }
+            # 마켓 분석 정보도 함께
+            if market in self.analyzers:
+                an = self.analyzers[market]
+                
+                # m1_change
+                m1_change = 0.0
+                if an.minute_candles:
+                    last_c = an.minute_candles[-1]
+                    op = last_c.get('opening_price', 0)
+                    if op > 0: m1_change = (price - op) / op * 100
+                
+                # buy_ratio
+                buy_ratio = 50.0
+                vol = an.bid_volume_1m + an.ask_volume_1m
+                if vol > 0: buy_ratio = an.bid_volume_1m / vol * 100
+                
+                mapping.update({
+                    "rsi": f"{an.rsi_value:.1f}",
+                    "fatigue": f"{an.fatigue_score:.1f}",
+                    "sentiment": an.market_sentiment,
+                    "m1_change": f"{m1_change:.2f}",
+                    "buy_ratio": f"{buy_ratio:.1f}"
+                })
+            
+            self.redis.hset(key, mapping=mapping)
+        except Exception: pass
+
+    def _update_redis_status(self):
+        """Redis에 봇 상태 및 자산 정보 업데이트"""
+        if not self.redis: return
+        try:
+            # 1. 자산 정보
+            assets_json = json.dumps(self.assets)
+            self.redis.set("[MON]:ASSETS", assets_json)
+            
+            # 2. 보유 종목 상태
+            positions = {}
+            for market, state in self.states.items():
+                if state.has_position():
+                    positions[market] = {
+                        'entry_price': state.entry_price,
+                        'current_price': self.current_prices.get(market, 0),
+                        'profit_rate': (self.current_prices.get(market, 0) - state.entry_price) / state.entry_price * 100 if state.entry_price > 0 else 0,
+                        'volume': state.position.get('volume', 0)
+                    }
+            self.redis.set("[MON]:POSITIONS", json.dumps(positions))
+            
+            # 3. 누적 수익
+            summary = {
+                'profit': self.cumulative_profit,
+                'trades': self.cumulative_trades,
+                'wins': self.cumulative_wins
+            }
+            self.redis.set("[MON]:SUMMARY", json.dumps(summary))
+            
+        except Exception: pass
+
     def _check_balance(self):
         """잔고 확인 (WebSocket 데이터 기반)"""
         try:
             # KRW 잔고 표시
             if 'KRW' in self.assets:
-                krw = self.assets['KRW']
-                balance = krw['balance']
-                locked = krw['locked']
                 krw = self.assets['KRW']
                 balance = krw['balance']
                 locked = krw['locked']
@@ -1433,6 +1703,9 @@ class MomentumTrader:
                           f"평가: {Color.YELLOW}{valuation:,.0f}원{Color.RESET} ({pnl_color}{profit_rate:+.2f}%{Color.RESET})")
                           
             logger.info(f"💵 총 자산 추정: {Color.YELLOW}{self.assets.get('KRW', {}).get('balance', 0) + total_valuation:,.0f}원{Color.RESET}")
+            
+            # Redis 업데이트
+            self._update_redis_status()
             
         except Exception as e:
             logger.error(f"잔고 확인 실패: {e}")
@@ -1495,17 +1768,21 @@ class MomentumTrader:
                                 if type_val == 'ticker':
                                     self.current_prices[code] = data.get('trade_price') or data.get('tp')
                                     self.last_price_updates[code] = datetime.now()
+                                    self._update_redis_ticker(code, self.current_prices[code])
                                     
                                 elif type_val == 'trade':
                                     # 체결 데이터 - 가격 업데이트 + 매수/매도 세력 분석
                                     self.current_prices[code] = data.get('trade_price') or data.get('tp', self.current_prices.get(code, 0))
                                     self.last_price_updates[code] = datetime.now()
+                                    self._update_redis_ticker(code, self.current_prices[code])
                                     # 체결 데이터를 Analyzer에 전달 (매수/매도 분석용)
                                     self.analyzers[code].update_trade_from_ws(data)
                                     
                                 elif type_val == 'orderbook':
                                     # 호가 데이터 - 매수벽/매도벽 분석
                                     self.analyzers[code].update_orderbook_from_ws(data)
+                                    if self.redis:
+                                        self.redis.set(f"[MON]:ORDERBOOK:{code}", json.dumps(data))
                                 
                                 elif type_val.startswith('candle.'):
                                     # 캔들 데이터 (1s, 1m, 5m, 15m 등)
@@ -1758,10 +2035,16 @@ class MomentumTrader:
             sentiment_info = f"심리:{sentiment['sentiment']}({sentiment['score']:.0f})"
             trade_ratio_info = f"매수:{sentiment['buy_pressure']*100:.0f}%/매도:{sentiment['sell_pressure']*100:.0f}%"
             
+            # MTF 정보 추가
+            mtf_stage = momentum.get('mtf_stage', 'unknown')
+            mtf_stage_icon = {'early': '🟢초기', 'mid': '🟡중반', 'late': '🔴후반', 'neutral': '⚪중립'}.get(mtf_stage, '❓')
+            mtf_trend_info = f"5m:{momentum.get('mtf_trend_5m', '-')} 15m:{momentum.get('mtf_trend_15m', '-')}"
+            
             logger.info(f"[{Color.BOLD}{market}{Color.RESET}] {rapid_indicator} 진입 신호 확정!")
             logger.info(f"   {momentum['reason']}")
             logger.info(f"   강도:{Color.MAGENTA}{momentum['strength']:.1f}{Color.RESET} | {sentiment_info} | {trade_ratio_info}")
             logger.info(f"   RSI:{sentiment['rsi']:.1f} | 피로도:{sentiment['fatigue']:.1f} | 호가불균형:{sentiment['orderbook_imbalance']:.2f}")
+            logger.info(f"   📊 MTF: {mtf_stage_icon} | {mtf_trend_info}")
             
             await self._execute_buy(market)
                 
@@ -1843,9 +2126,30 @@ class MomentumTrader:
                 volume = state.position.get('volume', 0)
                 self._log_trade(market, 'BUY', state.entry_price, invest_amount, volume, reason="진입")
                 
+                # 지표 요약
+                analyzer = self.analyzers[market]
+                rsi = analyzer.rsi_value
+                fatigue = analyzer.fatigue_score
+                
+                m1_change = 0
+                if analyzer.minute_candles:
+                    last_candle = list(analyzer.minute_candles)[-1]
+                    open_p = last_candle['opening_price']
+                    if open_p > 0:
+                        m1_change = (state.entry_price - open_p) / open_p * 100
+
+                buy_ratio = 50
+                total_vol = analyzer.bid_volume_1m + analyzer.ask_volume_1m
+                if total_vol > 0:
+                    buy_ratio = analyzer.bid_volume_1m / total_vol * 100
+                
+                stat_msg = f"1분:{m1_change:+.2f}% | RSI:{rsi:.0f} | 피로:{fatigue:.0f} | 매수:{buy_ratio:.0f}%"
+
                 logger.info(f"[{Color.BOLD}{market}{Color.RESET}] ✅ 매수 체결 | 가격: {Color.YELLOW}{state.entry_price:,.0f}원{Color.RESET} | "
+                          f"매수금액: {Color.YELLOW}{invest_amount:,.0f}원{Color.RESET} | "
                           f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET} | "
-                          f"익절가: {Color.GREEN}{state.take_profit_price:,.0f}원{Color.RESET}")
+                          f"익절가: {Color.GREEN}{state.take_profit_price:,.0f}원{Color.RESET} | "
+                          f"{stat_msg}")
                 
         except Exception as e:
             logger.error(f"[{market}] 매수 실행 오류: {e}")
@@ -1911,7 +2215,9 @@ class MomentumTrader:
             if int(time.time()) % 10 == 0:
                 pnl = profit_rate * 100
                 pnl_color = Color.GREEN if pnl >= 0 else Color.RED
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📈 보유 중 | 현재가: {Color.YELLOW}{current:,.0f}원{Color.RESET} | "
+                volume = state.position.get('volume', 0)
+                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📈 보유 중 | 수량: {Color.CYAN}{volume:,.4f}{Color.RESET} | "
+                          f"매수가: {Color.YELLOW}{entry:,.0f}원{Color.RESET} | 현재가: {Color.YELLOW}{current:,.0f}원{Color.RESET} | "
                           f"수익률: {pnl_color}{pnl:+.2f}%{Color.RESET} | "
                           f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}")
     
@@ -2030,14 +2336,55 @@ class MomentumTrader:
             return
             
         try:
-            volume = state.position.get('volume', 0)
+            currency = market.split('-')[1]
             current_price = self.current_prices[market]
             
             if DRY_RUN:
+                volume = state.position.get('volume', 0)
                 executed_price = current_price
                 logger.info(f"[{market}] 💵 [테스트] 시장가 매도 | 사유: {reason} | "
                           f"가격: {executed_price:,.0f}원")
             else:
+                # 실제 잔고 조회 (가장 최신 정보 사용)
+                try:
+                    accounts = self.api.get_accounts()
+                    actual_balance = 0.0
+                    for acc in accounts:
+                        if acc['currency'] == currency:
+                            actual_balance = float(acc['balance'])
+                            break
+                except Exception as e:
+                    logger.warning(f"[{market}] 잔고 조회 실패, 캐시된 값 사용: {e}")
+                    actual_balance = state.position.get('volume', 0)
+                
+                # 최소 주문 수량 체크 및 수량 결정
+                tracked_volume = state.position.get('volume', 0)
+                
+                # 실제 잔고가 있으면 그것을 사용, 없으면 트래킹된 값 사용
+                if actual_balance > 0:
+                    volume = actual_balance
+                    if abs(volume - tracked_volume) / max(tracked_volume, 0.00001) > 0.01:
+                        logger.warning(f"[{market}] 잔고 불일치 감지 | 트래킹: {tracked_volume:.8f} vs 실제: {volume:.8f}")
+                else:
+                    volume = tracked_volume
+                
+                # 최소 주문 금액 체크
+                order_value = volume * current_price
+                if order_value < 5000:  # 최소 주문 금액 5000원
+                    logger.warning(f"[{market}] 매도 주문 금액이 최소 금액(5000원) 미만: {order_value:,.0f}원")
+                    # 포지션 정리 (잔고 부족으로 매도 불가)
+                    state.position = None
+                    state.trailing_active = False
+                    return
+                
+                if volume <= 0:
+                    logger.error(f"[{market}] 매도할 수량이 없음 (volume: {volume})")
+                    state.position = None
+                    state.trailing_active = False
+                    return
+                
+                logger.info(f"[{market}] 매도 시도 | 수량: {volume:.8f} | 현재가: {current_price:,.0f}원 | 예상금액: {order_value:,.0f}원")
+                
                 # 실제 시장가 매도
                 result = self.api.place_order(
                     market=market,
@@ -2081,9 +2428,30 @@ class MomentumTrader:
             emoji = "🎉" if profit >= 0 else "📉"
             pnl_color = Color.GREEN if profit >= 0 else Color.RED
             cum_color = Color.GREEN if self.cumulative_profit >= 0 else Color.RED
+            # 지표 요약
+            analyzer = self.analyzers[market]
+            rsi = analyzer.rsi_value
+            fatigue = analyzer.fatigue_score
+            
+            m1_change = 0
+            if analyzer.minute_candles:
+                last_candle = list(analyzer.minute_candles)[-1]
+                open_p = last_candle['opening_price']
+                if open_p > 0:
+                    m1_change = (executed_price - open_p) / open_p * 100
+            
+            buy_ratio = 50
+            total_vol = analyzer.bid_volume_1m + analyzer.ask_volume_1m
+            if total_vol > 0:
+                buy_ratio = analyzer.bid_volume_1m / total_vol * 100
+            
+            stat_msg = f"1분:{m1_change:+.2f}% | RSI:{rsi:.0f} | 피로:{fatigue:.0f} | 매수:{buy_ratio:.0f}%"
+
             logger.info(f"[{Color.BOLD}{market}{Color.RESET}] {emoji} 매도 완료 | 사유: {reason} | "
+                       f"매도금액: {Color.YELLOW}{sell_amount:,.0f}원{Color.RESET} | "
                        f"수익: {pnl_color}{profit:+,.0f}원 ({profit_rate:+.2f}%){Color.RESET} | "
                        f"매도가: {Color.YELLOW}{executed_price:,.0f}원{Color.RESET}")
+            logger.info(f"   📊 판단기준: {stat_msg}")
             logger.info(f"💰 누적 수익: {cum_color}{self.cumulative_profit:+,.0f}원{Color.RESET} | "
                        f"총 {self.cumulative_trades}회 거래 (승:{self.cumulative_wins}/패:{self.cumulative_losses})")
             
