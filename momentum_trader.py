@@ -94,24 +94,29 @@ BREAKOUT_VELOCITY = 0.0015          # 분당 가격 가속도 (0.15%/min) - 강�
 
 # === 다중 타임프레임 분석 (Multi-Timeframe Analysis) - 핵심 개선 ===
 MTF_ENABLED = True                  # 다중 타임프레임 분석 활성화
-MTF_5M_MIN_CANDLES = 5              # 5분봉 최소 필요 개수
-MTF_15M_MIN_CANDLES = 3             # 15분봉 최소 필요 개수
+MTF_5M_MIN_CANDLES = 24             # 5분봉 최소 필요 개수 (24개 = 2시간)
+MTF_15M_MIN_CANDLES = 12            # 15분봉 최소 필요 개수 (12개 = 3시간)
 MTF_5M_TREND_THRESHOLD = 0.002      # 5분봉 상승 추세 기준 (0.2%)
 MTF_15M_TREND_THRESHOLD = 0.001     # 15분봉 상승/횡보 기준 (0.1%, 하락이 아니면 OK)
 MTF_5M_EARLY_STAGE_MAX = 0.025      # 5분봉 상승 초기 단계 최대치 (2.5% 이하여야 초기)
 MTF_VOLUME_CONFIRMATION = 1.5       # 5분봉 거래량 확인 배율 (평균 대비)
 MTF_STRICT_MODE = True              # 엄격 모드 (15분봉 하락 시 무조건 차단)
 
-# === 익절/손절 설정 ===
-INITIAL_STOP_LOSS = 0.02            # 초기 손절선 (2%) - 변동성 고려 완화
-TRAILING_STOP_ACTIVATION = 0.015    # 트레일링 스탑 활성화 기준 (+1.5% 수익 시)
-TRAILING_STOP_DISTANCE = 0.01       # 트레일링 스탑 거리 (1% - 고점 대비)
-TAKE_PROFIT_TARGET = 0.02           # 목표 수익률 (2% - 트레일링으로 더 추적)
+# === 익절/손절 설정 (핵심 개선) ===
+INITIAL_STOP_LOSS = 0.025           # 초기 손절선 (2.5%) - 빈번한 손절 방지
+DYNAMIC_STOP_LOSS_ENABLED = True    # 동적 손절선 활성화 (변동성 기반)
+DYNAMIC_STOP_LOSS_MIN = 0.018       # 동적 손절 최소 (1.8%)
+DYNAMIC_STOP_LOSS_MAX = 0.035       # 동적 손절 최대 (3.5%)
+TRAILING_STOP_ACTIVATION = 0.012    # 트레일링 스탑 활성화 기준 (+1.2% 수익 시) - 빨리 활성화
+TRAILING_STOP_DISTANCE = 0.008      # 트레일링 스탑 거리 (0.8% - 고점 대비) - 타이트하게
+TRAILING_MIN_PROFIT = 0.005         # 트레일링 시 최소 수익 보장 (0.5%)
+TAKE_PROFIT_TARGET = 0.025          # 목표 수익률 (2.5% - 상향)
 MAX_HOLDING_TIME = 21600            # 최대 보유 시간 (초, 6시간으로 연장)
 
-# === 리스크 관리 ===
-MAX_TRADES_PER_HOUR = 5             # 시간당 최대 거래 횟수 - 5회로 제한
-COOL_DOWN_AFTER_LOSS = 300          # 손절 후 대기 시간 (초) - 5분으로 연장
+# === 리스크 관리 (강화) ===
+MAX_TRADES_PER_HOUR = 20             # 시간당 최대 거래 횟수 - 20회로 제한 (과거래 방지)
+COOL_DOWN_AFTER_LOSS = 600          # 손절 후 대기 시간 (초) - 10분으로 강화
+CONSECUTIVE_LOSS_COOLDOWN = 1200    # 연속 손절 시 추가 대기 (20분)
 MIN_PRICE_STABILITY = 0.008         # 최소 가격 안정성 (급등락 필터) - 강화
 
 # === 시스템 설정 ===
@@ -377,7 +382,7 @@ class UpbitAPI:
 
 
 class TradingState:
-    """거래 상태 관리"""
+    """거래 상태 관리 (개선된 버전)"""
     
     def __init__(self, market: str = "Unknown"):
         self.market = market
@@ -388,11 +393,17 @@ class TradingState:
         self.stop_loss_price = 0.0        # 손절가
         self.take_profit_price = 0.0      # 익절가
         self.trailing_active = False      # 트레일링 스탑 활성화 여부
+        self.dynamic_stop_loss_rate = INITIAL_STOP_LOSS  # 동적 손절율
         
         # 거래 기록
         self.trades_today = []            # 오늘 거래 기록
         self.last_trade_time = None       # 마지막 거래 시간
         self.last_loss_time = None        # 마지막 손절 시간
+        
+        # === 연속 손실 추적 (신규) ===
+        self.consecutive_losses = 0       # 연속 손실 횟수
+        self.last_exit_price = 0.0        # 마지막 청산 가격 (재진입 방지용)
+        self.recent_loss_count = 0        # 최근 1시간 내 손실 횟수
         
         # 수익 추적
         self.total_profit = 0.0           # 총 수익
@@ -405,7 +416,7 @@ class TradingState:
         return self.position is not None
     
     def can_trade(self) -> bool:
-        """거래 가능 여부 확인"""
+        """거래 가능 여부 확인 (강화된 버전)"""
         now = datetime.now()
         
         # 시간당 거래 횟수 제한
@@ -414,18 +425,37 @@ class TradingState:
                         if t['time'] > hour_ago]
         if len(recent_trades) >= MAX_TRADES_PER_HOUR:
             return False
+        
+        # 최근 손실 횟수 업데이트
+        recent_losses = [t for t in self.trades_today 
+                        if t['time'] > hour_ago and t['type'] in ['stop_loss']]
+        self.recent_loss_count = len(recent_losses)
             
-        # 손절 후 쿨다운
+        # 손절 후 쿨다운 (기본)
         if self.last_loss_time:
             cooldown_end = self.last_loss_time + timedelta(seconds=COOL_DOWN_AFTER_LOSS)
             if now < cooldown_end:
                 return False
+            
+            # 연속 손실 시 추가 쿨다운 (2회 이상 연속 손실 시)
+            if self.consecutive_losses >= 2:
+                extended_cooldown = self.last_loss_time + timedelta(seconds=CONSECUTIVE_LOSS_COOLDOWN)
+                if now < extended_cooldown:
+                    return False
+        
+        # 최근 1시간 내 3회 이상 손실 시 추가 대기
+        if self.recent_loss_count >= 3:
+            return False
                 
         return True
     
+    def reset_consecutive_losses(self):
+        """연속 손실 카운터 초기화 (수익 거래 시)"""
+        self.consecutive_losses = 0
+    
     def record_trade(self, trade_type: str, amount: float, 
                     price: float, profit: float = 0.0):
-        """거래 기록"""
+        """거래 기록 (연속 손실 추적 포함)"""
         trade = {
             'time': datetime.now(),
             'type': trade_type,
@@ -440,14 +470,19 @@ class TradingState:
         if trade_type in ['take_profit', 'trailing_stop', 'time_exit']:
             if profit > 0:
                 self.winning_trades += 1
+                self.reset_consecutive_losses()  # 수익 시 연속 손실 리셋
             else:
                 self.losing_trades += 1
+                self.consecutive_losses += 1  # 손실인 경우에도 카운트
             self.total_profit += profit
+            self.last_exit_price = price  # 청산 가격 기록
             
         if trade_type == 'stop_loss':
             self.last_loss_time = trade['time']
             self.losing_trades += 1
+            self.consecutive_losses += 1  # 연속 손실 증가
             self.total_profit += profit
+            self.last_exit_price = price  # 청산 가격 기록
 
 
 class MarketAnalyzer:
@@ -1159,10 +1194,12 @@ class MarketAnalyzer:
     def detect_combined_momentum(self, current_price: float) -> Dict:
         """분봉 + 초봉 + 다중 타임프레임(5분/15분) 결합 모멘텀 감지
         
-        개선된 진입 로직:
+        개선된 진입 로직 (v3.1 강화):
         1. 1분봉/초봉으로 모멘텀 신호 감지
         2. 5분봉/15분봉으로 상승 초기 단계인지 확인
         3. 고점 추격 방지 (상승 후반/소진 단계 진입 차단)
+        4. 호가 불균형 필터 (매도벽 강하면 차단)
+        5. 최소 신호 강도 체크
         """
         minute_result = self.detect_momentum(current_price)
         
@@ -1177,12 +1214,30 @@ class MarketAnalyzer:
         
         # 분봉 기본조건 + 초봉 확인으로 정밀도 향상
         # 케이스 1: 분봉 신호 O + 초봉 확인 = 강력한 신호
-        # 케이스 2: 분봉 신호 X + 초봉 급등 = 빠른 진입 기회
+        # 케이스 2: 분봉 신호 X + 초봉 급등 = 빠른 진입 기회 (조건 강화!)
         
         combined_signal = False
         combined_strength = 0
         reasons = []
         mtf_blocked = False
+        
+        # === 0단계: 호가 불균형 사전 필터 (v3.1 추가) ===
+        orderbook_imbalance = self.orderbook.get('imbalance', 0)
+        if orderbook_imbalance <= -0.3:
+            # 매도벽이 30% 이상 강하면 진입 차단
+            return {
+                'signal': False,
+                'strength': 0,
+                'minute_signal': minute_result['signal'],
+                'second_signal': second_result.get('signal', False),
+                'rapid_rise': second_result.get('rapid_rise', False),
+                'mtf_valid': mtf_result['valid_entry'],
+                'mtf_stage': mtf_result.get('stage', 'unknown'),
+                'mtf_trend_5m': mtf_result.get('trend_5m', 'neutral'),
+                'mtf_trend_15m': mtf_result.get('trend_15m', 'neutral'),
+                'mtf_blocked': True,
+                'reason': f'🚫 호가불균형 차단 (매도우위:{orderbook_imbalance:.2f})'
+            }
         
         # === 1단계: 기존 1분봉/초봉 신호 확인 ===
         if minute_result['signal'] and second_result.get('signal', False):
@@ -1193,11 +1248,20 @@ class MarketAnalyzer:
             reasons.append(second_result['reason'])
             
         elif second_result.get('rapid_rise', False):
-            # 초봉 급등만 감지: 빠른 진입 (분봉 조건 완화)
-            if minute_result['price_change'] > MOMENTUM_THRESHOLD * 0.8:  # 분봉 조건 80% 충족 필요 (기준 강화)
+            # 초봉 급등만 감지: 빠른 진입 (조건 대폭 강화!)
+            # v3.1: 분봉 조건 90% 충족 + MTF 상승 추세 필요
+            has_minute_support = minute_result['price_change'] > MOMENTUM_THRESHOLD * 0.9
+            has_bullish_trend = mtf_result.get('trend_5m') == 'bullish' or mtf_result.get('trend_15m') == 'bullish'
+            
+            if has_minute_support and has_bullish_trend:
                 combined_signal = True
                 combined_strength = second_result['strength']
                 reasons.append(f"⚡빠른진입: {second_result['reason']}")
+            elif has_minute_support:
+                # 분봉 지지만 있고 MTF 상승이 아니면 강도 대폭 하락
+                combined_signal = True
+                combined_strength = second_result['strength'] * 0.5  # 50% 감소
+                reasons.append(f"⚠️ 약한진입: {second_result['reason']} (MTF 미확인)")
                 
         elif minute_result['signal']:
             # 분봉 신호만: 일반 진입
@@ -1225,6 +1289,15 @@ class MarketAnalyzer:
                     combined_signal = False  # 후반 진입 차단
                     mtf_blocked = True
                     reasons.append(f"🚫 상승후반 - 진입차단")
+                elif stage == 'neutral' or stage == 'unknown':
+                    # v3.1: MTF 중립/미확인 시 추가 조건 적용
+                    combined_strength = combined_strength * 0.7  # 30% 감소
+                    if combined_strength < 70:  # 중립 시 강도 70 이상 필요
+                        combined_signal = False
+                        mtf_blocked = True
+                        reasons.append(f"🚫 MTF 중립 + 강도 부족 ({combined_strength:.0f}<70)")
+                    else:
+                        reasons.append(f"⚠️ MTF중립 (강도:{combined_strength:.0f})")
                 
                 # 거래량 확인 보너스
                 if mtf_result['volume_confirmed']:
@@ -1239,6 +1312,13 @@ class MarketAnalyzer:
                         combined_signal = False
                         mtf_blocked = True
                         reasons.append(f"🚫 15분봉 하락추세")
+        
+        # === 3단계: 최소 신호 강도 체크 (v3.1 추가) ===
+        MIN_SIGNAL_STRENGTH = 60
+        if combined_signal and combined_strength < MIN_SIGNAL_STRENGTH:
+            combined_signal = False
+            mtf_blocked = True
+            reasons.append(f"🚫 최소 강도 미달 ({combined_strength:.0f}<{MIN_SIGNAL_STRENGTH})")
         
         return {
             'signal': combined_signal,
@@ -1979,6 +2059,15 @@ class MomentumTrader:
         analyzer = self.analyzers[market]
         current_price = self.current_prices[market]
         
+        # === 재진입 방지 (손절 후 동일 가격대 재진입 차단) ===
+        if state.last_exit_price > 0 and state.consecutive_losses > 0:
+            # 마지막 청산가 대비 2% 이상 하락해야 재진입 허용
+            min_reentry_price = state.last_exit_price * 0.98
+            if current_price > min_reentry_price:
+                if int(time.time()) % 30 == 0:  # 30초에 한번 로그
+                    logger.debug(f"[{market}] ⏳ 재진입 대기 - 현재가({current_price:,.0f}) > 재진입가({min_reentry_price:,.0f})")
+                return
+        
         try:
             # 캔들 데이터 부족하면 대기
             if len(analyzer.minute_candles) < MOMENTUM_WINDOW:
@@ -2001,9 +2090,10 @@ class MomentumTrader:
                         logger.debug(f"   경고: {warnings}")
                 return
             
-            # 피로도가 높으면 신중하게 접근 (진입 조건 강화)
-            high_fatigue = sentiment['fatigue'] >= 40
-            overbought = sentiment['rsi'] >= 70
+            # 피로도가 높으면 신중하게 접근 (진입 조건 강화) - 임계값 강화
+            high_fatigue = sentiment['fatigue'] >= 35  # 40 -> 35로 강화
+            overbought = sentiment['rsi'] >= 65  # 70 -> 65로 강화
+            very_overbought = sentiment['rsi'] >= 75  # 극심한 과매수
             
             # ==== 2단계: 모멘텀 감지 (분봉 + 초봉) ====
             momentum = analyzer.detect_combined_momentum(current_price)
@@ -2011,17 +2101,22 @@ class MomentumTrader:
             if not momentum['signal']:
                 return
             
-            # ==== 3단계: 피로도/과매수 시 추가 필터링 ====
+            # ==== 3단계: 피로도/과매수 시 추가 필터링 (강화) ====
+            if very_overbought:
+                # RSI 75 이상: 진입 차단
+                logger.info(f"[{market}] 🚫 극심한 과매수 (RSI:{sentiment['rsi']:.0f}) - 진입 차단")
+                return
+                
             if high_fatigue or overbought:
-                # 피로도 높거나 과매수이면, 더 강력한 신호만 허용
-                if momentum['strength'] < 70:
+                # 피로도 높거나 과매수이면, 더 강력한 신호만 허용 (75로 강화)
+                if momentum['strength'] < 75:
                     if int(time.time()) % 15 == 0:
                         logger.info(f"[{market}] ⚠️ 신호 감지되었으나 피로도/과매수로 신중 대기 | "
                                   f"피로도:{sentiment['fatigue']:.0f} RSI:{sentiment['rsi']:.0f} 강도:{momentum['strength']:.0f}")
                     return
                 
-                # 매도 우위라면 진입 차단
-                if sentiment['sell_pressure'] > 0.55:
+                # 매도 우위라면 진입 차단 (50%로 강화)
+                if sentiment['sell_pressure'] > 0.50:
                     logger.info(f"[{market}] ⚠️ 매도 우위 전환 감지 - 진입 보류 (매도비율:{sentiment['sell_pressure']*100:.1f}%)")
                     return
             
@@ -2116,7 +2211,18 @@ class MomentumTrader:
                 state.entry_price = state.position['price']
                 state.entry_time = datetime.now()
                 state.highest_price = state.entry_price
-                state.stop_loss_price = state.entry_price * (1 - INITIAL_STOP_LOSS)
+                
+                # === 동적 손절선 계산 (변동성 기반) ===
+                analyzer = self.analyzers[market]
+                if DYNAMIC_STOP_LOSS_ENABLED and analyzer.volatility > 0:
+                    # 변동성에 따라 손절선 조정 (최소 ~ 최대 범위 내)
+                    volatility_factor = min(analyzer.volatility * 10, 1.0)  # 0 ~ 1로 정규화
+                    dynamic_stop = DYNAMIC_STOP_LOSS_MIN + (DYNAMIC_STOP_LOSS_MAX - DYNAMIC_STOP_LOSS_MIN) * volatility_factor
+                    state.dynamic_stop_loss_rate = max(DYNAMIC_STOP_LOSS_MIN, min(dynamic_stop, DYNAMIC_STOP_LOSS_MAX))
+                else:
+                    state.dynamic_stop_loss_rate = INITIAL_STOP_LOSS
+                
+                state.stop_loss_price = state.entry_price * (1 - state.dynamic_stop_loss_rate)
                 state.take_profit_price = state.entry_price * (1 + TAKE_PROFIT_TARGET)
                 state.trailing_active = False
                 
@@ -2155,7 +2261,7 @@ class MomentumTrader:
             logger.error(f"[{market}] 매수 실행 오류: {e}")
     
     async def _manage_position(self, market: str):
-        """포지션 관리 (익절/손절 판단)"""
+        """포지션 관리 (익절/손절 판단) - 개선된 버전"""
         state = self.states[market]
         if not state.has_position():
             return
@@ -2171,11 +2277,20 @@ class MomentumTrader:
             # 트레일링 스탑 활성화 확인
             if profit_rate >= TRAILING_STOP_ACTIVATION and not state.trailing_active:
                 state.trailing_active = True
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📊 트레일링 스탑 활성화 | 수익률: {Color.GREEN}{profit_rate*100:.2f}%{Color.RESET}")
+                # 최소 수익 보장선 설정 (매입가 + 최소 수익률)
+                min_profit_price = entry * (1 + TRAILING_MIN_PROFIT)
+                state.stop_loss_price = max(state.stop_loss_price, min_profit_price)
+                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📊 트레일링 스탑 활성화 | "
+                          f"수익률: {Color.GREEN}{profit_rate*100:.2f}%{Color.RESET} | "
+                          f"최소 수익 보장: {Color.YELLOW}{TRAILING_MIN_PROFIT*100:.1f}%{Color.RESET}")
             
             # 트레일링 스탑 가격 업데이트
             if state.trailing_active:
                 new_stop = current * (1 - TRAILING_STOP_DISTANCE)
+                # 최소 수익 보장선보다 높을 때만 업데이트
+                min_profit_price = entry * (1 + TRAILING_MIN_PROFIT)
+                new_stop = max(new_stop, min_profit_price)
+                
                 if new_stop > state.stop_loss_price:
                     old_stop = state.stop_loss_price
                     state.stop_loss_price = new_stop
@@ -2196,10 +2311,11 @@ class MomentumTrader:
             if not state.trailing_active:
                 # 트레일링 스탑 활성화
                 state.trailing_active = True
-                # 손절선을 매입가로 올림 (손실 없이 청산 보장)
-                state.stop_loss_price = entry
+                # 손절선을 최소 수익 보장선으로 올림
+                min_profit_price = entry * (1 + TRAILING_MIN_PROFIT)
+                state.stop_loss_price = max(entry, min_profit_price)
                 logger.info(f"[{market}] 🎯 목표 수익률 {TAKE_PROFIT_TARGET*100:.1f}% 도달! "
-                          f"트레일링 활성화 (손절가→매입가: {entry:,.0f}원)")
+                          f"트레일링 활성화 (최소 수익 보장: {TRAILING_MIN_PROFIT*100:.1f}%)")
             # 계속 상승 추세 추적 (바로 익절하지 않음)
         
         # 3. 최대 보유 시간 초과
@@ -2216,10 +2332,28 @@ class MomentumTrader:
                 pnl = profit_rate * 100
                 pnl_color = Color.GREEN if pnl >= 0 else Color.RED
                 volume = state.position.get('volume', 0)
+                
+                # 평가금액 계산 (수량 × 현재가)
+                eval_amount = volume * current
+                # 매수금액 계산 (수량 × 매수가)
+                buy_amount = volume * entry
+                # 수익금 계산
+                profit_amount = eval_amount - buy_amount
+                profit_color = Color.GREEN if profit_amount >= 0 else Color.RED
+                
+                # 익절가 (트레일링 활성화 시)
+                take_profit_info = ""
+                if state.trailing_active:
+                    # 트레일링 스탑 거리로 익절가 계산 (고점 대비)
+                    take_profit_price = state.highest_price * (1 - TRAILING_STOP_DISTANCE)
+                    take_profit_info = f" | 익절가: {Color.GREEN}{take_profit_price:,.0f}원{Color.RESET}"
+                
                 logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📈 보유 중 | 수량: {Color.CYAN}{volume:,.4f}{Color.RESET} | "
                           f"매수가: {Color.YELLOW}{entry:,.0f}원{Color.RESET} | 현재가: {Color.YELLOW}{current:,.0f}원{Color.RESET} | "
-                          f"수익률: {pnl_color}{pnl:+.2f}%{Color.RESET} | "
-                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}")
+                          f"평가금액: {Color.CYAN}{eval_amount:,.0f}원{Color.RESET}")
+                logger.info(f"   수익률: {pnl_color}{pnl:+.2f}%{Color.RESET} | "
+                          f"수익금: {profit_color}{profit_amount:+,.0f}원{Color.RESET} | "
+                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}{take_profit_info}")
     
     
     def _sync_state_with_balance(self):
