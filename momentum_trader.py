@@ -23,6 +23,8 @@ import time
 import json
 import uuid
 import asyncio
+import threading
+import queue
 import hashlib
 import logging
 from datetime import datetime, timedelta
@@ -33,6 +35,8 @@ from urllib.parse import urlencode, unquote
 import jwt
 import requests
 import websockets
+from prompt_toolkit import PromptSession
+from prompt_toolkit.patch_stdout import patch_stdout
 from dotenv import load_dotenv
 
 # =================================================================================
@@ -55,7 +59,7 @@ BTC_DOWNTREND_BUY_BLOCK = False      # BTC 하락 시 매수 금지 (True: 적�
 MACRO_LOOKBACK_DAYS = 7             # 일봉 분석 기간 (일)
 MACRO_MIN_CHANGE_RATE = -0.015      # 전체 하락장 판단 기준 (-1.5% 이하면 관망) - 강화
 MACRO_BULLISH_THRESHOLD = 0.015     # 상승장 판단 기준 (+1.5% 이상) - 강화
-MACRO_UPDATE_INTERVAL = 300         # 거시 분석 갱신 주기 (초)
+MACRO_UPDATE_INTERVAL = 60          # 거시 분석 갱신 주기 (초) - 1분마다
 
 # === 미시적 분석 (Micro Analysis) - 진입 신호 (대폭 강화) ===
 MOMENTUM_WINDOW = 20                # 모멘텀 계산 윈도우 (캔들 개수) - 20분으로 확대
@@ -72,7 +76,7 @@ SECOND_RAPID_RISE_THRESHOLD = 0.006 # 급등 판단 기준 (0.6%/5초) - 노이�
 
 # === 단타 전문가 기법 (Pro Scalping) 파라미터 ===
 SHORT_TREND_WINDOW = 20             # 단기 추세 확인 (20분) - 확대
-SHORT_MOMENTUM_THRESHOLD = 0.008    # 단기 급반등 기준 (20분 내 0.8% 이상) - 강화
+SHORT_MOMENTUM_THRESHOLD = 0.015    # 단기 급반등 기준 (1.5% 이상) - 상향 조정 (노이즈 제거)
 VOL_INTENSITY_THRESHOLD = 2.5       # 수급 집중도 (평균 대비 2.5배 이상)
 BREAKOUT_VELOCITY = 0.0015          # 분당 가격 가속도 (0.15%/min) - 강화
 
@@ -81,8 +85,9 @@ MTF_ENABLED = True                  # 다중 타임프레임 분석 활성화
 MTF_5M_MIN_CANDLES = 24             # 5분봉 최소 필요 개수 (24개 = 2시간)
 MTF_15M_MIN_CANDLES = 12            # 15분봉 최소 필요 개수 (12개 = 3시간)
 MTF_5M_TREND_THRESHOLD = 0.002      # 5분봉 상승 추세 기준 (0.2%)
-MTF_15M_TREND_THRESHOLD = 0.001     # 15분봉 상승/횡보 기준 (0.1%, 하락이 아니면 OK)
-MTF_5M_EARLY_STAGE_MAX = 0.025      # 5분봉 상승 초기 단계 최대치 (2.5% 이하여야 초기)
+MTF_15M_TREND_THRESHOLD = 0.002     # 15분봉 상승 기준 (0.2% - 상향)
+MTF_5M_EARLY_STAGE_MAX = 0.02       # 5분봉 상승 초기 단계 최대치 (1.5% 이하여야 초기) - 2.5%에서 강화
+MTF_MAX_1M_CHANGE = 0.03            # 1분봉 급등 제한 (3% 이상 급등 시 진입 차단)
 MTF_VOLUME_CONFIRMATION = 1.5       # 5분봉 거래량 확인 배율 (평균 대비)
 MTF_STRICT_MODE = True              # 엄격 모드 (15분봉 하락 시 무조건 차단)
 
@@ -92,19 +97,39 @@ DATA_DIR = "data"
 # === 장기 추세 필터 (Long-Term Trend Filter) - v3.2 신규 ===
 LONG_TERM_FILTER_ENABLED = True     # 장기 추세 필터 활성화 (핵심!)
 DAILY_BEARISH_THRESHOLD = -0.02     # 일봉 하락 임계값 (-2% 이하면 하락장)
-H4_BEARISH_THRESHOLD = -0.015       # 4시간봉 하락 임계값 (-1.5% 이하면 하락 추세)
+H4_BEARISH_THRESHOLD = -0.005       # 4시간봉 하락 임계값 (-0.5% 이하면 하락 추세) - 상향
 DAILY_BEARISH_BLOCK = True          # 일봉 하락 시 무조건 진입 차단
 H4_BEARISH_BLOCK = True             # 4시간봉 하락 시 진입 차단
 IGNORE_SHORT_SQUEEZE_IN_DOWNTREND = True  # 하락장에서 Short Squeeze 신호 무시
 
+# === 장기하락 예외 처리 (v3.3 신규) ===
+STRONG_SHORT_MOMENTUM_5M_THRESHOLD = 0.015    # 단기 급등 예외: 5분봉 임계값 (+1.5%)
+STRONG_SHORT_MOMENTUM_H4_MIN = 0.0            # 단기 급등 예외: 4시간봉 최소 (0% 이상, 즉 플러스)
+STRONG_MOMENTUM_BUY_PRESSURE_MIN = 0.55       # 단기 급등 예외: 매수 우위 최소 (55% 이상)
+STRONG_MOMENTUM_FATIGUE_MAX = 40              # 단기 급등 예외: 피로도 최대 (40 이하, 상승 둔화 방지)
+STRONG_MOMENTUM_1M_CONSISTENCY_MIN = 3        # 1분봉 일관성: 최근 5개 중 양수 최소 개수 (3개 이상)
+# 위 모든 조건을 만족하면 장기하락 차단을 무시하고 진입 허용
+
+# === V자 반등 및 안정성 체크 (v3.4 신규) ===
+V_REVERSAL_ENABLED = True                     # V자 반등 감지 활성화
+V_REVERSAL_MIN_DROP = -0.003                  # V자 반등: 최소 하락폭 (1분봉 기준, -0.3% 이상 하락)
+V_REVERSAL_MIN_RISE = 0.002                   # V자 반등: 최소 반등폭 (1분봉 기준, +0.2% 이상 반등)
+VOLATILITY_MAX_STDDEV = 0.008                 # 변동성 최대값: 1분봉 표준편차 0.8% 이하 (오락가락 방지)
+MARKET_SYNC_MIN_COUNT = 12                    # 동반 상승: 최소 N개 종목 동반 상승 (20개 중 12개)
+MARKET_SYNC_THRESHOLD = 0.002                 # 동반 상승: 종목별 최소 상승률 (0.2% 이상)
+
+# === 분석 주기 (v3.3 개선) ===
+ANALYSIS_INTERVAL = 10                        # 분석 주기 (10초) - 빠른 반응
+
 # === 익절/손절 설정 (핵심 개선) ===
-INITIAL_STOP_LOSS = 0.025           # 초기 손절선 (2.5%) - 빈번한 손절 방지
+INITIAL_STOP_LOSS = 0.020           # 초기 손절선 (2.0%) - 손실 최소화
 DYNAMIC_STOP_LOSS_ENABLED = True    # 동적 손절선 활성화 (변동성 기반)
-DYNAMIC_STOP_LOSS_MIN = 0.018       # 동적 손절 최소 (1.8%)
-DYNAMIC_STOP_LOSS_MAX = 0.035       # 동적 손절 최대 (3.5%)
-TRAILING_STOP_ACTIVATION = 0.012    # 트레일링 스탑 활성화 기준 (+1.2% 수익 시) - 빨리 활성화
-TRAILING_STOP_DISTANCE = 0.008      # 트레일링 스탑 거리 (0.8% - 고점 대비) - 타이트하게
-TRAILING_MIN_PROFIT = 0.005         # 트레일링 시 최소 수익 보장 (0.5%)
+DYNAMIC_STOP_LOSS_MIN = 0.015       # 동적 손절 최소 (1.5%)
+DYNAMIC_STOP_LOSS_MAX = 0.025       # 동적 손절 최대 (2.5%) (너무 큰 손실 방지)
+TRAILING_STOP_ACTIVATION = 0.008    # 트레일링 스탑 활성화 기준 (+0.8% 수익 시) - 더 빨리 활성화
+TRAILING_STOP_DISTANCE = 0.004      # 트레일링 스탑 거리 (0.4% - 고점 대비) - 타이트하게
+TRAILING_MIN_PROFIT = 0.003         # 트레일링 시 최소 수익 보장 (0.3%)
+BREAK_EVEN_TRIGGER = 0.006          # 본절 스탑 발동 (+0.6% 도달 시 손절가=매수가)
 TAKE_PROFIT_TARGET = 0.025          # 목표 수익률 (2.5% - 상향)
 MAX_HOLDING_TIME = 21600            # 최대 보유 시간 (초, 6시간으로 연장)
 
@@ -473,6 +498,12 @@ class TradingState:
                         if t['time'] > hour_ago]
         if len(recent_trades) >= MAX_TRADES_PER_HOUR:
             return False
+            
+        # [중요] 매도(익절/손절) 후 최소 쿨타임 (5분) - 재진입 방지
+        if self.last_trade_time:
+            time_diff = (now - self.last_trade_time).total_seconds()
+            if time_diff < 300:  # 5분 대기 (300초)
+                return False
         
         # 최근 손실 횟수 업데이트
         recent_losses = [t for t in self.trades_today 
@@ -583,34 +614,57 @@ class MarketAnalyzer:
         self.sentiment_score = 50.0        # 시장 심리 점수 (0-100)
         
     def load_candles_from_disk(self, unit: int) -> List[Dict]:
-        """디스크에서 캔들 데이터 로드 (JSON)"""
+        """디스크에서 캔들 데이터 로드 (CSV)"""
         try:
-            filename = f"{DATA_DIR}/{self.market}_{unit}m.json"
+            filename = f"{DATA_DIR}/{self.market}_{unit}m.csv"
             if not os.path.exists(filename):
                 return []
             
-            with open(filename, 'r', encoding='utf-8') as f:
-                candles = json.load(f)
-                # ISO 포맷 시간 문자열 처리 등 필요한 경우 여기서?
-                # 일단 raw dict 리스트 반환
-                return candles
+            import pandas as pd
+            df = pd.read_csv(filename)
+            # DataFrame을 dict 리스트로 변환
+            candles = df.to_dict('records')
+            return candles
         except Exception as e:
+            logger.error(f"[{self.market}] CSV 로드 실패({unit}m): {e}")
             return []
 
     def save_candles_to_disk(self, unit: int, candles: deque):
-        """디스크에 캔들 데이터 저장 (JSON)"""
+        """디스크에 캔들 데이터 저장 (CSV)"""
         try:
             if not os.path.exists(DATA_DIR):
                 os.makedirs(DATA_DIR, exist_ok=True)
                 
-            filename = f"{DATA_DIR}/{self.market}_{unit}m.json"
-            # deque -> list 변환
+            filename = f"{DATA_DIR}/{self.market}_{unit}m.csv"
+            # deque -> list -> DataFrame 변환
             data_to_save = list(candles)
             
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(data_to_save, f)
+            import pandas as pd
+            df = pd.DataFrame(data_to_save)
+            df.to_csv(filename, index=False, encoding='utf-8')
         except Exception as e:
             logger.error(f"[{self.market}] 캔들 저장 실패({unit}m): {e}")
+
+    def append_candle_to_disk(self, unit: int, candle: Dict):
+        """단일 캔들을 디스크에 추가 (실시간 기록용)"""
+        try:
+            if not os.path.exists(DATA_DIR):
+                os.makedirs(DATA_DIR, exist_ok=True)
+                
+            filename = f"{DATA_DIR}/{self.market}_{unit}m.csv"
+            
+            import pandas as pd
+            # 단일 캔들을 DataFrame으로 변환
+            df = pd.DataFrame([candle])
+            
+            # 파일이 존재하면 append, 없으면 새로 생성
+            if os.path.exists(filename):
+                df.to_csv(filename, mode='a', header=False, index=False, encoding='utf-8')
+            else:
+                df.to_csv(filename, mode='w', header=True, index=False, encoding='utf-8')
+        except Exception as e:
+            # 실시간 기록 실패는 치명적이지 않으므로 warning 레벨
+            logger.warning(f"[{self.market}] 실시간 캔들 기록 실패({unit}m): {e}")
 
     def initialize_candles_smart(self, unit: int, max_count: int, deque_obj: deque):
         """로컬 데이터 로드 + API 부족분 요청 (스마트 초기화)"""
@@ -684,44 +738,155 @@ class MarketAnalyzer:
             deque_obj.extend(candles)
 
     def analyze_macro(self) -> Dict:
-        """시장 추세 분석 (v3.2 강화 - 장기 하락 추세 필터 추가)
+        """시장 추세 분석 (v3.3 수정 - 정확한 장기 추세 계산)
         
         핵심 개선:
+        - 메모리의 5분봉 데이터로 정확한 4시간/3일 추세 계산
         - 일봉/4시간봉 하락 시 Short Squeeze와 관계없이 진입 차단
-        - 장기 추세 가중치 대폭 상향
-        - 하락장 반등 진입 방지
         """
         try:
-            # 1. 초단기 분석 (15분봉/30분봉)
-            time.sleep(0.1)
-            m15 = self.api.get_candles_minutes(self.market, unit=15, count=2)
-            m15_change = (m15[0]['trade_price'] - m15[1]['trade_price']) / m15[1]['trade_price'] if len(m15) >= 2 else 0
+            # 1. 15분봉 변화율 - 메모리 데이터 사용 (API 호출 제거)
+            m15_change = 0
+            if len(self.minute15_candles) >= 2:
+                m15_start = self.minute15_candles[-2]['trade_price']
+                m15_current = self.minute15_candles[-1]['trade_price']
+                m15_change = (m15_current - m15_start) / m15_start if m15_start > 0 else 0
             
-            time.sleep(0.1)
-            m30 = self.api.get_candles_minutes(self.market, unit=30, count=2)
-            m30_change = (m30[0]['trade_price'] - m30[1]['trade_price']) / m30[1]['trade_price'] if len(m30) >= 2 else 0
+            # 2. 30분봉 변화율 - 5분봉 6개로 계산 (API 호출 제거)
+            m30_change = 0
+            if len(self.minute5_candles) >= 7:  # 30분 = 6개 + 비교용 1개
+                m30_start = self.minute5_candles[-7]['trade_price']
+                m30_current = self.minute5_candles[-1]['trade_price']
+                m30_change = (m30_current - m30_start) / m30_start if m30_start > 0 else 0
 
-            # 2. 중단기 분석 (1시간/4시간)
-            time.sleep(0.1)
-            h1 = self.api.get_candles_minutes(self.market, unit=60, count=2)
-            h1_change = (h1[0]['trade_price'] - h1[1]['trade_price']) / h1[1]['trade_price'] if len(h1) >= 2 else 0
+            # 3. 1시간봉 변화율 - 5분봉 12개로 계산 (API 호출 제거)
+            h1_change = 0
+            if len(self.minute5_candles) >= 13:  # 1시간 = 12개 + 비교용 1개
+                h1_start = self.minute5_candles[-13]['trade_price']
+                h1_current = self.minute5_candles[-1]['trade_price']
+                h1_change = (h1_current - h1_start) / h1_start if h1_start > 0 else 0
 
-            time.sleep(0.1)
-            h4 = self.api.get_candles_minutes(self.market, unit=240, count=2)
-            h4_change = (h4[0]['trade_price'] - h4[1]['trade_price']) / h4[1]['trade_price'] if len(h4) >= 2 else 0
+            # 4. 4시간 추세 - 메모리의 5분봉 데이터 사용
+            h4_change = 0
+            if len(self.minute5_candles) >= 48:  # 4시간 = 48개 * 5분
+                h4_start = self.minute5_candles[-48]['trade_price']
+                h4_current = self.minute5_candles[-1]['trade_price']
+                h4_change = (h4_current - h4_start) / h4_start if h4_start > 0 else 0
             
-            # 3. 일봉 분석 (대세 확인) - 3일치 분석으로 확장
-            time.sleep(0.1)
-            daily = self.api.get_candles_days(self.market, count=4)
-            daily_change = (daily[0]['trade_price'] - daily[1]['trade_price']) / daily[1]['trade_price'] if len(daily) >= 2 else 0
-            # 3일간 추세 (더 긴 기간 확인)
-            daily_3d_change = (daily[0]['trade_price'] - daily[3]['trade_price']) / daily[3]['trade_price'] if len(daily) >= 4 else 0
+            # 5. 5분봉 변화율 계산
+            m5_change = 0
+            if len(self.minute5_candles) >= 2:
+                m5_start = self.minute5_candles[-2]['trade_price']
+                m5_current = self.minute5_candles[-1]['trade_price']
+                m5_change = (m5_current - m5_start) / m5_start if m5_start > 0 else 0
+            
+            # 3-2. 1분봉 일관성 체크 (v3.3: 5분 사이 지속적 상승 확인)
+            m1_consistency_count = 0
+            m1_changes = []  # V자 반등 분석용
+            
+            if len(self.minute_candles) >= 5:
+                # 최근 5개 1분봉의 변화율 확인
+                for i in range(-5, 0):
+                    if i == -5:
+                        continue
+                    prev_price = self.minute_candles[i-1]['trade_price']
+                    curr_price = self.minute_candles[i]['trade_price']
+                    change = (curr_price - prev_price) / prev_price if prev_price > 0 else 0
+                    m1_changes.append(change)
+                    if change > 0:  # 상승
+                        m1_consistency_count += 1
+            
+            # 3-3. V자 반등 패턴 감지 (v3.4 최종: 빠른 감지 + 엄격한 조건)
+            # 조건 1: 3시간 동안 뚜렷한 반등 없음 확인
+            long_downtrend = False
+            if len(self.minute15_candles) >= 12:  # 15분봉 12개 = 3시간
+                # 3시간 동안 최고가 찾기
+                last_12_candles = list(self.minute15_candles)[-12:]
+                max_price_3h = max(candle['high_price'] for candle in last_12_candles)
+                current_price = self.minute15_candles[-1]['trade_price']
+                
+                # 고점 대비 현재 가격
+                drop_from_high = (current_price - max_price_3h) / max_price_3h if max_price_3h > 0 else 0
+                
+                # 3시간 동안 뚜렷한 반등(+2%) 없이 고점 대비 계속 낮은 상태
+                if drop_from_high <= -0.015:  # 고점 대비 -1.5% 이상 하락 상태
+                    # 3시간 전체 동안 +1% 이상 반등이 한 번도 없었는지 확인
+                    max_rise_in_3h = 0
+                    for i in range(1, len(last_12_candles)):
+                        prev = last_12_candles[i-1]['trade_price']
+                        curr = last_12_candles[i]['trade_price']
+                        rise = (curr - prev) / prev if prev > 0 else 0
+                        max_rise_in_3h = max(max_rise_in_3h, rise)
+                    
+                    # 3시간 동안 단 한 번도 뚜렷한 반등(+1%) 없음
+                    if max_rise_in_3h < 0.01:
+                        long_downtrend = True
+            
+            # 조건 2: 1분봉으로 V자 반등 빠르게 감지 (5분)
+            v_reversal_detected = False
+            if V_REVERSAL_ENABLED and len(m1_changes) >= 4 and long_downtrend:
+                # 1분봉 5개 = 5분간 데이터 (빠른 반응)
+                # 패턴: 초반 2개 (2분) 하락, 후반 2개 (2분) 반등
+                first_half = m1_changes[:2]   # 초반 2분
+                second_half = m1_changes[2:]  # 후반 2분
+                
+                first_half_drop = sum(first_half)   # 초반 하락폭
+                second_half_rise = sum(second_half)  # 후반 반등폭
+                
+                # V자 조건: 초반 하락 + 후반 반등 (1분봉 기준)
+                if (first_half_drop <= V_REVERSAL_MIN_DROP and 
+                    second_half_rise >= V_REVERSAL_MIN_RISE):
+                    v_reversal_detected = True
+            
+            # 3-4. 변동성 체크 (v3.4: 1분봉 오락가락 필터링)
+            m1_volatility = 0
+            volatility_ok = True
+            if len(m1_changes) >= 3:
+                import statistics
+                m1_volatility = statistics.stdev(m1_changes) if len(m1_changes) > 1 else 0
+                volatility_ok = (m1_volatility <= VOLATILITY_MAX_STDDEV)
+            
+            # 6. 일봉 변화율 - 5분봉으로 계산 (API 호출 제거)
+            daily_change = 0
+            if len(self.minute5_candles) >= 288:  # 1일 = 288개 * 5분 (24시간)
+                daily_start = self.minute5_candles[-288]['trade_price']
+                daily_current = self.minute5_candles[-1]['trade_price']
+                daily_change = (daily_current - daily_start) / daily_start if daily_start > 0 else 0
+            
+            # 7. 3일 추세 - 메모리의 5분봉 데이터 사용
+            daily_3d_change = 0
+            if len(self.minute5_candles) >= 576:  # 3일 = 576개 * 5분 (72시간)
+                d3_start = self.minute5_candles[-576]['trade_price']
+                d3_current = self.minute5_candles[-1]['trade_price']
+                daily_3d_change = (d3_current - d3_start) / d3_start if d3_start > 0 else 0
 
             # === [v3.2 핵심] 장기 하락 추세 차단 ===
             long_term_bearish = False
             block_reason = None
             
-            if LONG_TERM_FILTER_ENABLED:
+            # === [v3.3] 단기 급등 예외 조건 검사 ===
+            # 5분봉 +1.5% + 1분봉 일관성 + 4시간봉 플러스 + 매수 우위 + 낮은 피로도
+            buy_pressure = 0.5  # 기본값
+            if self.bid_volume_1m + self.ask_volume_1m > 0:
+                buy_pressure = self.bid_volume_1m / (self.bid_volume_1m + self.ask_volume_1m)
+            
+            # 1분봉 일관성: 최근 5개 중 3개 이상 상승
+            m1_consistent = (m1_consistency_count >= STRONG_MOMENTUM_1M_CONSISTENCY_MIN)
+            
+            # v3.4: V자 반등 조건 (활성화 시에만 체크)
+            v_reversal_ok = (not V_REVERSAL_ENABLED or v_reversal_detected)
+            
+            strong_short_momentum = (
+                m5_change >= STRONG_SHORT_MOMENTUM_5M_THRESHOLD and 
+                m1_consistent and                      # v3.3: 1분봉 일관성
+                volatility_ok and                       # v3.4: 변동성 체크 (오락가락 방지)
+                v_reversal_ok and                       # v3.4: V자 반등 (옵션)
+                h4_change > STRONG_SHORT_MOMENTUM_H4_MIN and
+                buy_pressure >= STRONG_MOMENTUM_BUY_PRESSURE_MIN and
+                self.fatigue_score <= STRONG_MOMENTUM_FATIGUE_MAX
+            )
+            
+            if LONG_TERM_FILTER_ENABLED and not strong_short_momentum:
                 # 일봉 하락 체크 (3일 기준)
                 if daily_3d_change <= DAILY_BEARISH_THRESHOLD and DAILY_BEARISH_BLOCK:
                     long_term_bearish = True
@@ -731,6 +896,9 @@ class MarketAnalyzer:
                 if h4_change <= H4_BEARISH_THRESHOLD and H4_BEARISH_BLOCK:
                     long_term_bearish = True
                     block_reason = block_reason or f"4시간봉 하락 ({h4_change*100:.2f}%)"
+            elif strong_short_momentum and LONG_TERM_FILTER_ENABLED:
+                # 단기 급등 예외 로그
+                logger.info(f"[{self.market}] 🚀 단기 급등 감지 (5m:{m5_change*100:+.2f}% 1m일관:{m1_consistency_count}/3 4h:{h4_change*100:+.2f}% 매수:{buy_pressure*100:.1f}% 피로:{self.fatigue_score:.1f}) - 장기하락 차단 예외 적용")
             
             # 종합 점수 계산 (v3.2: 장기 가중치 강화)
             # 15분(20%) + 30분(15%) + 1시간(20%) + 4시간(25%) + 1일(20%)
@@ -764,18 +932,39 @@ class MarketAnalyzer:
                 'trend': trend,
                 'score': score,
                 'can_trade': can_trade,
+                'm5_change': m5_change,  # v3.3 추가 (5분봉)
+                'm1_consistency': m1_consistency_count,  # v3.3 추가 (1분봉 일관성)
                 'm15_change': m15_change,
                 'h4_change': h4_change,
                 'daily_change': daily_change,
                 'daily_3d_change': daily_3d_change,
                 'short_squeeze': short_squeeze,
                 'long_term_bearish': long_term_bearish,
-                'block_reason': block_reason
+                'block_reason': block_reason,
+                'strong_short_momentum': strong_short_momentum,  # v3.3 추가
+                'buy_pressure': buy_pressure,  # v3.3 추가
+                'fatigue_score': self.fatigue_score  # v3.3 추가
             }
+            self.macro_result = result  # [핵심] 상세 분석 결과 저장
             
-            log_msg = f"[{self.market}] 📊 추세 분석 | {trend} | 15m:{m15_change*100:+.2f}% 4h:{h4_change*100:+.2f}% 일:{daily_change*100:+.2f}% 3일:{daily_3d_change*100:+.2f}%"
+            # 색상 코드 지정
+            m5_color = Color.RED if m5_change >= 0 else Color.BLUE
+            m15_color = Color.RED if m15_change >= 0 else Color.BLUE
+            h4_color = Color.RED if h4_change >= 0 else Color.BLUE
+            d_color = Color.RED if daily_change >= 0 else Color.BLUE
+            d3_color = Color.RED if daily_3d_change >= 0 else Color.BLUE
+
+            log_msg = (f"[{self.market:<11}] 📊 추세 분석 | {trend:<7} | "
+                      f"5m:{m5_color}{m5_change*100:>+6.2f}%{Color.RESET} "
+                      f"15m:{m15_color}{m15_change*100:>+6.2f}%{Color.RESET} "
+                      f"4h:{h4_color}{h4_change*100:>+6.2f}%{Color.RESET} "
+                      f"일:{d_color}{daily_change*100:>+6.2f}%{Color.RESET} "
+                      f"3일:{d3_color}{daily_3d_change*100:>+6.2f}%{Color.RESET}")
+
             if long_term_bearish:
                 log_msg += f" | 🚫 장기하락 차단"
+            elif strong_short_momentum:
+                log_msg += f" | 🚀 단기 급등 (예외 허용, 1m일관:{m1_consistency_count}/3, 매수:{buy_pressure*100:.0f}%)"
             elif short_squeeze:
                 log_msg += " | 🔥 Short Squeeze"
             logger.info(log_msg)
@@ -787,10 +976,12 @@ class MarketAnalyzer:
             return {'trend': 'neutral', 'score': 0, 'can_trade': True, 'long_term_bearish': False}
     
     def update_candles(self, candles: List[Dict]):
-        """1분봉 데이터 업데이트"""
+        """1분봉 데이터 업데이트 (실시간 디스크 기록 포함)"""
         for candle in reversed(candles):  # 시간순 정렬
             self.minute_candles.append(candle)
             self.volume_history.append(candle['candle_acc_trade_volume'])
+            # 실시간으로 디스크에 기록
+            self.append_candle_to_disk(1, candle)
     
     def update_candles_5m(self, candles: List[Dict]):
         """5분봉 데이터 업데이트"""
@@ -1161,15 +1352,75 @@ class MarketAnalyzer:
         
         # === 1. 5분봉 분석 ===
         if len(self.minute5_candles) >= MTF_5M_MIN_CANDLES:
-            candles_5m = list(self.minute5_candles)[-MTF_5M_MIN_CANDLES:]
+            candles_5m = list(self.minute5_candles) # 전체 가져오기
+            
+            # --- [v3.5 수정] 이동평균선(MA) 기반 낙폭과대 반등 분석 ---
+            # 사용자의 의도: "하락 추세 속의 기술적 반등(Dead Cat Bounce) 잡기"
+            ma15 = 0
+            ma50 = 0
+            
+            if len(candles_5m) >= 15:
+                ma15 = sum(c['trade_price'] for c in candles_5m[-15:]) / 15
+            
+            if len(candles_5m) >= 50:
+                ma50 = sum(c['trade_price'] for c in candles_5m[-50:]) / 50
+                
+            # MA 분석: 역배열/정배열 확인 및 이격도 계산
+            is_downtrend = False
+            if ma15 > 0 and ma50 > 0 and ma15 < ma50:
+                is_downtrend = True # 하락 추세 (역배열)
+                
+            # 이격도(Disparity) 계산: 현재가와 MA15의 괴리율
+            disparity = 0
+            if ma15 > 0:
+                disparity = (current_price - ma15) / ma15
+            
+            # [전략 수정 v3.6] 하락 추세일 경우 '확실한 바닥'만 잡기
+            if is_downtrend:
+                # KRW-BERA, BARD 같은 '완만한 하락'이나 '데드크로스' 회피
+                # 조건: 이격도가 충분히 커야 함 (-1.5% 이상 과대 낙폭)
+                # 조건: 거래량이 실려야 함 (바닥 매수세 유입 확인)
+                
+                # 최근 캔들 분석
+                last_candle = candles_5m[-1]
+                is_bullish_candle = last_candle['trade_price'] > last_candle['opening_price']
+                
+                # 거래량 분석
+                avg_vol = 0
+                if len(candles_5m) >= 4:
+                    avg_vol = sum(c['candle_acc_trade_volume'] for c in candles_5m[-4:-1]) / 3
+                current_vol = last_candle['candle_acc_trade_volume']
+                is_volume_spike = avg_vol > 0 and current_vol >= avg_vol * 1.5
+                
+                if disparity < -0.015: # MA15보다 1.5% 이상 아래 (과대 낙폭)
+                    if is_bullish_candle and is_volume_spike:
+                        result['reasons'].append(f"📉 낙폭과대+거래량실린반등 (이격:{disparity*100:.1f}%)")
+                    elif is_bullish_candle:
+                         result['warnings'].append(f"⚠️ 거래량 부족한 반등 (이격:{disparity*100:.1f}%)")
+                    else:
+                         result['warnings'].append(f"⚠️ 하락가속화 (이격:{disparity*100:.1f}%)")
+                else:
+                    # 완만한 하락이거나 약한 하락세 -> 진입 금지 (가장 위험한 구간)
+                    result['valid_entry'] = False
+                    result['warnings'].append(f"🚫 하락추세 진행중 (이격부족:{disparity*100:.1f}%)")
+            
+            # 정배열일 경우
+            elif ma15 > 0 and ma50 > 0:
+                if disparity < 0:
+                    # 정배열인데 MA 아래 = 눌림목(Pullback) 매수 기회
+                    result['reasons'].append(f"눌림목 구간 (이격도:{disparity*100:.1f}%)")
+
+            # --- 기존 분석 로직 유지 ---
+            # 최근 N개만 사용하여 등락률 계산
+            candles_recent = candles_5m[-MTF_5M_MIN_CANDLES:]
             
             # 5분봉 전체 변화율 (시작 ~ 현재)
-            start_price = candles_5m[0]['opening_price']
+            start_price = candles_recent[0]['opening_price']
             change_5m = (current_price - start_price) / start_price if start_price > 0 else 0
             result['change_5m'] = change_5m
             
             # 최근 5분봉 2개의 추세
-            recent_5m_change = (candles_5m[-1]['trade_price'] - candles_5m[-2]['trade_price']) / candles_5m[-2]['trade_price'] if candles_5m[-2]['trade_price'] > 0 else 0
+            recent_5m_change = (candles_recent[-1]['trade_price'] - candles_recent[-2]['trade_price']) / candles_recent[-2]['trade_price'] if len(candles_recent) >= 2 and candles_recent[-2]['trade_price'] > 0 else 0
             
             # 5분봉 추세 판단
             if change_5m >= MTF_5M_TREND_THRESHOLD and recent_5m_change >= 0:
@@ -1177,19 +1428,23 @@ class MarketAnalyzer:
                 result['reasons'].append(f"5분봉 상승 추세 ({change_5m*100:.2f}%)")
             elif change_5m <= -MTF_5M_TREND_THRESHOLD:
                 result['trend_5m'] = 'bearish'
-                result['warnings'].append(f"5분봉 하락 추세 ({change_5m*100:.2f}%)")
+                # [수정] 하락 추세라도 '반등' 조건이 충족되면 bearish 경고만 하고 차단은 안 함
+                if is_downtrend and disparity < -0.015:
+                     result['reasons'].append(f"하락 중 반등 가능성")
+                else:
+                     result['warnings'].append(f"5분봉 하락 추세 ({change_5m*100:.2f}%)")
             else:
                 result['trend_5m'] = 'neutral'
             
             # 상승 단계 판단 (핵심!)
             if change_5m >= MTF_5M_EARLY_STAGE_MAX:
-                # 이미 2.5% 이상 상승 = 후반/소진 단계
+                # 이미 1.5% 이상 상승 = 후반/소진 단계
                 result['stage'] = 'late'
                 result['warnings'].append(f"⚠️ 상승 후반 ({change_5m*100:.2f}%) - 고점 추격 위험")
                 result['valid_entry'] = False
             elif change_5m >= MTF_5M_TREND_THRESHOLD:
-                # 0.2% ~ 2.5% 상승 = 초기~중반
-                if change_5m <= 0.01:  # 1% 이하
+                # 0.2% ~ 1.5% 상승 = 초기~중반
+                if change_5m <= 0.008:  # 0.8% 이하
                     result['stage'] = 'early'
                     result['reasons'].append(f"✅ 상승 초기 ({change_5m*100:.2f}%)")
                 else:
@@ -1199,9 +1454,9 @@ class MarketAnalyzer:
                 result['stage'] = 'neutral'
             
             # 5분봉 거래량 확인
-            if len(candles_5m) >= 3:
-                avg_vol = sum(c['candle_acc_trade_volume'] for c in candles_5m[:-1]) / (len(candles_5m) - 1)
-                current_vol = candles_5m[-1]['candle_acc_trade_volume']
+            if len(candles_recent) >= 3:
+                avg_vol = sum(c['candle_acc_trade_volume'] for c in candles_recent[:-1]) / (len(candles_recent) - 1)
+                current_vol = candles_recent[-1]['candle_acc_trade_volume']
                 if avg_vol > 0 and current_vol >= avg_vol * MTF_VOLUME_CONFIRMATION:
                     result['volume_confirmed'] = True
                     result['reasons'].append(f"거래량 확인 ({current_vol/avg_vol:.1f}x)")
@@ -1460,50 +1715,112 @@ class MarketAnalyzer:
             combined_signal = True
             combined_strength = minute_result['strength'] * 0.8
             reasons.append(minute_result['reason'])
+
+        # === 1.5단계: 추세 추종 진입 기회 포착 (New: 지속 상승형) ===
+        # 급등은 아니지만(모멘텀 X), 확실한 상승 추세에 올라타기
+        if not combined_signal:
+            # 1. 5분봉/15분봉 모두 양호한 상승세
+            trend_bullish = mtf_result.get('trend_5m') == 'bullish' and mtf_result.get('trend_15m') in ['bullish', 'neutral']
+            
+            # 2. 거래량 실린 매수세 확인 (가장 중요, 5분 누적 기준)
+            total_vol_5m = self.bid_volume_5m + self.ask_volume_5m
+            buy_ratio_5m = (self.bid_volume_5m / total_vol_5m * 100) if total_vol_5m > 0 else 50
+            strong_buying = buy_ratio_5m >= 55.0
+            
+            # 3. 최소한의 상승 탄력 (0.3% 이상 1분 상승)
+            active_rising = minute_result.get('price_change', 0) >= 0.003
+            
+            # 4. 200원 이상 거래대금 (너무 거래 없는 잡코인 제외)
+            has_volume = total_vol_5m * current_price > 10000000 # 1천만원
+            
+            if trend_bullish and strong_buying and active_rising: # 조건 완화: has_volume 제거 (초기엔)
+                # 진입 결정!
+                combined_signal = True
+                combined_strength = 60 # 기본 강도 부여
+                reasons.append(f"📈 추세추종: 상승세(5m:{mtf_result.get('change_5m',0)*100:.2f}%) + 매수세({buy_ratio_5m:.0f}%)")
         
-        # === 2단계: MTF 필터 적용 (핵심!) ===
+        # === 2단계: MTF 필터 적용 (핵심 개선) ===
         if combined_signal and MTF_ENABLED:
-            # MTF 분석 결과에 따른 진입 차단/허용
-            if not mtf_result['valid_entry']:
+            # 1. 5분봉 하락 추세 차단 (KRW-SAFE 사례 방지)
+            if mtf_result.get('trend_5m') == 'bearish':
+                combined_signal = False
+                mtf_blocked = True
+                reasons.append(f"🚫 5분봉 하락추세 ({mtf_result.get('change_5m',0)*100:.2f}%)")
+            
+            # 1-1. 5분봉 모멘텀 약화 감지 (신규 추가)
+            # 최근 5분봉 변화율이 감소 추세면 진입 보류
+            elif len(self.minute5_candles) >= 3:
+                recent_5m_changes = []
+                for i in range(-3, 0):
+                    if abs(i) <= len(self.minute5_candles):
+                        curr = self.minute5_candles[i]['trade_price']
+                        prev = self.minute5_candles[i-1]['trade_price']
+                        change = (curr - prev) / prev if prev > 0 else 0
+                        recent_5m_changes.append(change)
+                
+                # 최근 3개 5분봉 중 마지막이 이전보다 약화되었는지 체크
+                if len(recent_5m_changes) >= 2:
+                    last_momentum = recent_5m_changes[-1]
+                    prev_momentum = recent_5m_changes[-2]
+                    
+                    # 상승세였는데 급격히 약화 (50% 이상 감소)
+                    if prev_momentum > 0.003 and last_momentum < prev_momentum * 0.5:
+                        combined_signal = False
+                        mtf_blocked = True
+                        reasons.append(f"🚫 5분봉 모멘텀 약화 ({prev_momentum*100:.2f}% → {last_momentum*100:.2f}%)")
+            
+            # 2. 1분봉 과도한 급등 차단 (고점 추격 방지)
+            elif minute_result.get('price_change', 0) >= MTF_MAX_1M_CHANGE:
+                combined_signal = False
+                mtf_blocked = True
+                reasons.append(f"🚫 1분봉 과도한 급등 ({minute_result.get('price_change',0)*100:.2f}%) - 고점 위험")
+            
+            # 3. MTF 분석 결과에 따른 진입 차단/허용
+            elif not mtf_result['valid_entry']:
                 combined_signal = False
                 mtf_blocked = True
                 reasons.append(f"🚫 MTF 차단: {' | '.join(mtf_result['warnings'])}")
             else:
                 # 상승 단계에 따른 강도 조정
                 stage = mtf_result.get('stage', 'unknown')
-                if stage == 'early':
+                
+                # 중립 단계 필터링 (명확한 상승세 없으면 진입 자제)
+                if (stage == 'neutral' or stage == 'unknown') and combined_strength < 80:
+                    combined_signal = False 
+                    mtf_blocked = True
+                    reasons.append(f"⚪ MTF 중립 - 강도 부족 ({combined_strength:.1f}<80)")
+                
+                elif stage == 'early':
                     combined_strength = min(100, combined_strength * 1.2)  # 초기 단계 보너스
                     reasons.append(f"🎯 상승초기 진입")
                 elif stage == 'mid':
-                    combined_strength = combined_strength * 0.9  # 중반은 약간 할인
-                    reasons.append(f"📈 상승중반")
+                    combined_strength = combined_strength * 0.85  # 중반은 할인 (0.9 -> 0.85)
+                    # 중반 단계는 할인 후에도 강도 90 이상이어야 진입 (신규 강화)
+                    if combined_strength < 90:
+                        combined_signal = False
+                        mtf_blocked = True
+                        reasons.append(f"🚫 상승중반 강도부족 ({combined_strength:.1f}<90) - 타이밍 늦음")
+                    else:
+                        reasons.append(f"📈 상승중반")
                 elif stage == 'late':
                     combined_signal = False  # 후반 진입 차단
                     mtf_blocked = True
                     reasons.append(f"🚫 상승후반 - 진입차단")
-                elif stage == 'neutral' or stage == 'unknown':
-                    # v3.1: MTF 중립/미확인 시 추가 조건 적용
-                    combined_strength = combined_strength * 0.7  # 30% 감소
-                    if combined_strength < 70:  # 중립 시 강도 70 이상 필요
-                        combined_signal = False
-                        mtf_blocked = True
-                        reasons.append(f"🚫 MTF 중립 + 강도 부족 ({combined_strength:.0f}<70)")
-                    else:
-                        reasons.append(f"⚠️ MTF중립 (강도:{combined_strength:.0f})")
                 
-                # 거래량 확인 보너스
-                if mtf_result['volume_confirmed']:
-                    combined_strength = min(100, combined_strength + 10)
-                
-                # 15분봉 추세 보너스/패널티
-                if mtf_result['trend_15m'] == 'bullish':
-                    combined_strength = min(100, combined_strength + 5)
-                elif mtf_result['trend_15m'] == 'bearish':
-                    combined_strength = max(0, combined_strength - 15)
-                    if MTF_STRICT_MODE:
-                        combined_signal = False
-                        mtf_blocked = True
-                        reasons.append(f"🚫 15분봉 하락추세")
+                if combined_signal:
+                    # 거래량 확인 보너스
+                    if mtf_result['volume_confirmed']:
+                        combined_strength = min(100, combined_strength + 10)
+                    
+                    # 15분봉 추세 보너스/패널티
+                    if mtf_result['trend_15m'] == 'bullish':
+                        combined_strength = min(100, combined_strength + 5)
+                    elif mtf_result['trend_15m'] == 'bearish':
+                        combined_strength = max(0, combined_strength - 20)
+                        if MTF_STRICT_MODE:
+                            combined_signal = False
+                            mtf_blocked = True
+                            reasons.append(f"🚫 15분봉 하락추세")
         
         # === 3단계: 최소 신호 강도 체크 (v3.1 추가) ===
         if combined_signal and combined_strength < MIN_SIGNAL_STRENGTH:
@@ -1544,6 +1861,7 @@ class MomentumTrader:
         self.last_price_updates = {}
         
         self.running = True
+        self.user_cmd_queue = queue.Queue()
         
         # 자산 및 주문 (WebSocket 업데이트)
         self.active_orders = {} 
@@ -1622,10 +1940,7 @@ class MomentumTrader:
                             self.analyzers[market] = MarketAnalyzer(self.api, market)
                             
                         try:
-                            self.analyzers[market].analyze_macro()
-                            
-                            # 1분봉 로드
-                            candles = self.api.get_candles_minutes(market, CANDLE_UNIT, 200)
+                            # 1분봉 스마트 로드 (200개) - 디스크 저장 및 갭 채우기 포함
                             self.analyzers[market].update_candles(candles)
                             
                             # 5분봉 스마트 로드 (600개)
@@ -1638,8 +1953,11 @@ class MomentumTrader:
                             sec_candles = self.api.get_candles_seconds(market, 120)
                             self.analyzers[market].update_second_candles(sec_candles)
                             
+                            # 데이터 로드 후 거시 분석 실행 (순서 변경)
+                            self.analyzers[market].analyze_macro()
+                            
                             self.last_price_updates[market] = None
-                            logger.info(f"[{market}] 초기 데이터 로드 완료 (1분:{len(candles)} 5분:{len(self.analyzers[market].minute5_candles)} 15분:{len(self.analyzers[market].minute15_candles)} 초:{len(sec_candles)})")
+                            logger.info(f"[{market:<11}] 초기 데이터 로드 완료 (5분:{len(self.analyzers[market].minute5_candles)} 15분:{len(self.analyzers[market].minute15_candles)})")
                             
                         except Exception as e:
                             logger.error(f"[{market}] 초기 데이터 로딩 실패: {e}")
@@ -1694,11 +2012,13 @@ class MomentumTrader:
                         
                     # 초기 데이터 로딩 (캔들, 거시분석)
                     try:
-                        self.analyzers[market].analyze_macro()
+                        # 1분봉 스마트 로드 (200개) - 디스크 저장 및 갭 채우기 포함
+                        self.analyzers[market].initialize_candles_smart(CANDLE_UNIT, 200, self.analyzers[market].minute_candles)
                         
-                        # 1분봉 로드
-                        candles = self.api.get_candles_minutes(market, CANDLE_UNIT, 200)
-                        self.analyzers[market].update_candles(candles)
+                        # volume_history 동기화 (1분봉의 경우 필요)
+                        self.analyzers[market].volume_history.clear()
+                        for candle in self.analyzers[market].minute_candles:
+                            self.analyzers[market].volume_history.append(candle['candle_acc_trade_volume'])
                         
                         # 5분봉 스마트 로드 (600개)
                         self.analyzers[market].initialize_candles_smart(5, 600, self.analyzers[market].minute5_candles)
@@ -1710,8 +2030,11 @@ class MomentumTrader:
                         sec_candles = self.api.get_candles_seconds(market, 120)
                         self.analyzers[market].update_second_candles(sec_candles)
                         
+                        # 데이터 로드 후 거시 분석 실행 (순서 변경)
+                        self.analyzers[market].analyze_macro()
+                        
                         self.last_price_updates[market] = None
-                        logger.info(f"[{market}] 초기 데이터 로드 완료 (5분:{len(self.analyzers[market].minute5_candles)} 15분:{len(self.analyzers[market].minute15_candles)})")
+                        logger.info(f"[{market:<11}] 초기 데이터 로드 완료 (5분:{len(self.analyzers[market].minute5_candles)} 15분:{len(self.analyzers[market].minute15_candles)})")
                         
                     except Exception as e:
                         logger.error(f"[{market}] 초기 데이터 로딩 실패: {e}")
@@ -1720,6 +2043,267 @@ class MomentumTrader:
                 
         except Exception as e:
             logger.error(f"마켓 리스트 갱신 실패: {e}")
+
+    def start_command_listener(self):
+        """별도 스레드에서 사용자 입력 대기 (prompt_toolkit 사용)"""
+        def listen():
+            # PromptSession 생성
+            session = PromptSession()
+            
+            while self.running:
+                try:
+                    # patch_stdout 컨텍스트 내에서 prompt 실행
+                    # 이렇게 하면 로그가 prompt 위로 출력됨
+                    with patch_stdout(raw=True):  # raw=True는 ANSI 코드 처리 도움
+                        command = session.prompt("USER_CMD> ")
+                        
+                        if command:
+                            self.user_cmd_queue.put(command.strip())
+                            
+                except (EOFError, KeyboardInterrupt):
+                    logger.info("❌ 커맨드 리스너 종료 (EOF/Interrupt)")
+                    break
+                except Exception as e:
+                    # 기타 오류 발생 시 잠시 대기 후 재시도
+                    print(f"Command Error: {e}")
+                    time.sleep(1)
+                    
+        cmd_thread = threading.Thread(target=listen, daemon=True)
+        cmd_thread.start()
+
+    async def process_user_command(self, cmd_line: str):
+        """사용자 명령어 처리"""
+        try:
+            parts = cmd_line.strip().split()
+            if not parts:
+                return
+            
+            cmd = parts[0].lower()
+            
+            if cmd in ['/exit', '/quit', 'exit', 'quit']:
+                logger.info("🛑 사용자 종료 명령 수신")
+                self.running = False
+                return
+
+            if cmd == '/help':
+                print("\\n=== 명령어 목록 ===")
+                print("/buy <종목> <금액> : 시장가 매수 (예: /buy BTC 10000)")
+                print("/sell <종목>        : 시장가 전량 매도 (예: /sell BTC)")
+                print("/status, /my      : 보유 자산 및 수익 현황")
+                print("/price <종목>     : 현재가 조회")
+                print("/trend <종목>     : 추세 분석 결과 조회")
+                print("/stoploss <종목> <가격> : 손절가 수동 지정")
+                print("/tp <종목> <가격>       : 익절가 수동 지정")
+                print("==================\\n")
+                return
+
+            if cmd == '/status' or cmd == '/my':
+                # 자산 현황 출력
+                balance_krw = 0
+                total_asset = 0
+                for bal in self.balances:
+                    if bal['currency'] == 'KRW':
+                        balance_krw = float(bal['balance'])
+                        total_asset += balance_krw
+                    else:
+                        market = f"KRW-{bal['currency']}"
+                        if market in self.current_prices:
+                            curr_price = self.current_prices[market]
+                            balance = float(bal['balance'])
+                            value = balance * curr_price
+                            total_asset += value
+                            if balance * curr_price > 5000: # 소액 제외
+                                avg = float(bal['avg_buy_price'])
+                                profit_rate = (curr_price - avg) / avg * 100 if avg > 0 else 0
+                                logger.info(f"   🪙 {bal['currency']:<4} | 평가:{value:,.0f}원 ({profit_rate:+.2f}%) | 평단:{avg:,.0f} 현재:{curr_price:,.0f}")
+                
+                logger.info(f"💰 총 자산: {total_asset:,.0f}원 (KRW: {balance_krw:,.0f}원)")
+                logger.info(f"   현재 수익: {self.cumulative_profit:,.0f}원 (승:{self.winning_trades} 패:{self.losing_trades})")
+                return
+
+            if cmd == '/buy':
+                # /buy BTC 100000 -> KRW-BTC 10만원 시장가 매수
+                if len(parts) < 3:
+                    logger.warning("사용법: /buy <종목> <금액>")
+                    return
+                
+                coin = parts[1].upper().replace('KRW-', '')
+                market = f"KRW-{coin}"
+                try:
+                    amount_krw = float(parts[2])
+                except ValueError:
+                    logger.warning("금액은 숫자여야 합니다.")
+                    return
+                
+                logger.info(f"🛒 [사용자 매수] {market} {amount_krw:,.0f}원 주문 시도")
+                
+                # 가짜 TradingState 생성 또는 기존 사용
+                if market not in self.states:
+                    self.states[market] = TradingState(market)
+                    
+                # 시장가 매수 호출
+                if DRY_RUN:
+                    logger.info(f"🧪 [Simulation] 매수 체결 가정: {market} {amount_krw:,}원")
+                    if market in self.current_prices:
+                         price = self.current_prices[market]
+                         self.states[market].avg_buy_price = price
+                         self.states[market].position_size = amount_krw / price
+                         logger.info(f"   보유량 업데이트: {self.states[market].position_size:.4f} {coin}")
+                else:
+                    result = self.api.buy_market_order(market, amount_krw)
+                    if result:
+                         logger.info(f"✅ 매수 주문 접수 완료: {result}")
+                    else:
+                         logger.error("❌ 매수 주문 실패")
+                return
+
+            if cmd == '/sell':
+                # /sell BTC -> KRW-BTC 전량 매도
+                if len(parts) < 2:
+                    logger.warning("사용법: /sell <종목>")
+                    return
+                
+                coin = parts[1].upper().replace('KRW-', '')
+                market = f"KRW-{coin}"
+                
+                # 보유량 확인
+                balance = 0
+                for bal in self.balances:
+                    if bal['currency'] == coin:
+                        balance = float(bal['balance'])
+                        break
+                
+                # 시뮬레이션 상태 확인
+                if DRY_RUN and market in self.states:
+                     # 시뮬레이션에서는 states 정보 활용
+                     pass 
+
+                if balance <= 0 and not (DRY_RUN):
+                    logger.warning(f"⚠️ 보유량이 없습니다: {coin}")
+                    return
+
+                logger.info(f"📉 [사용자 매도] {market} 전량 매도 시도 ({balance:.4f} {coin})")
+                
+                if DRY_RUN:
+                    logger.info(f"🧪 [Simulation] 매도 체결 가정: {market}")
+                    if market in self.states:
+                        self.states[market].reset()
+                else:
+                    await self._execute_sell(market, "사용자 강제 청산")
+                return
+
+            if cmd == '/trend':
+                 # /trend BTC
+                 if len(parts) < 2:
+                    logger.warning("사용법: /trend <종목>")
+                    return
+                 coin = parts[1].upper().replace('KRW-', '')
+                 market = f"KRW-{coin}"
+                 
+                 found = False
+                 for m in self.markets:
+                     if m == market:
+                         found = True
+                         break
+                 if not found:
+                      logger.warning(f"감시 중인 종목이 아닙니다: {market}")
+                 
+                 if market in self.analyzers:
+                     # 강제 분석 실행
+                     self.analyzers[market].analyze_macro()
+                     res = self.analyzers[market].macro_result
+                     mr = res if res else {}
+                     
+                     trend_emoji = "🔴" if self.analyzers[market].macro_trend == 'bearish' else "🟢" if self.analyzers[market].macro_trend == 'bullish' else "🟡"
+                     
+                     logger.info(f"📊 {market} 추세 분석 결과: {trend_emoji} {self.analyzers[market].macro_trend.upper()}")
+                     logger.info(f"   스코어: {self.analyzers[market].macro_score:.2f}")
+                     logger.info(f"   변화율: 5m({mr.get('m5_change',0)*100:+.2f}%) 15m({mr.get('m15_change',0)*100:+.2f}%) 4h({mr.get('h4_change',0)*100:+.2f}%)")
+                 else:
+                     logger.warning(f"분석 데이터가 없습니다: {market}")
+                 return
+            if cmd == '/stoploss':
+                 # /stoploss BTC 123000
+                 if len(parts) < 3:
+                     logger.warning("사용법: /stoploss <종목> <가격>")
+                     return
+                 coin = parts[1].upper().replace('KRW-', '')
+                 market = f"KRW-{coin}"
+                 try:
+                     price = float(parts[2])
+                 except ValueError:
+                     logger.warning("가격은 숫자여야 합니다.")
+                     return
+                 
+                 found = False
+                 if market in self.states:
+                     state = self.states[market]
+                     old = state.stop_loss_price
+                     state.stop_loss_price = price
+                     state.trailing_active = False # 수동 지정 시 트레일링 비활성화 (충돌 방지)
+                     logger.info(f"[{market}] ✅ 손절가 수동 변경: {old:,.0f} -> {price:,.0f}원 (트레일링 OFF)")
+                     found = True
+                 
+                 if not found:
+                      logger.warning(f"보유 중이지 않거나 관리 중인 종목이 아닙니다: {market}")
+                 return
+
+            if cmd == '/takeprofit' or cmd == '/tp':
+                 # /takeprofit BTC 130000
+                 if len(parts) < 3:
+                     logger.warning("사용법: /takeprofit <종목> <가격>")
+                     return
+                 coin = parts[1].upper().replace('KRW-', '')
+                 market = f"KRW-{coin}"
+                 try:
+                     price = float(parts[2])
+                 except ValueError:
+                     logger.warning("가격은 숫자여야 합니다.")
+                     return
+                 
+                 found = False
+                 if market in self.states:
+                     state = self.states[market]
+                     old = state.take_profit_price
+                     state.take_profit_price = price
+                     logger.info(f"[{market}] ✅ 익절가 수동 변경: {old:,.0f} -> {price:,.0f}원")
+                     found = True
+                 
+                 if not found:
+                      logger.warning(f"보유 중이지 않거나 관리 중인 종목이 아닙니다: {market}")
+                 return
+
+            if cmd == '/price':
+                 if len(parts) < 2:
+                    logger.warning("사용법: /price <종목>")
+                    return
+                 coin = parts[1].upper().replace('KRW-', '')
+                 market = f"KRW-{coin}"
+                 if market in self.current_prices:
+                     logger.info(f"💰 {market}: {self.current_prices[market]:,.0f}원")
+                 else:
+                     logger.warning("가격 정보가 없습니다.")
+                 return
+                 
+            logger.warning(f"알 수 없는 명령어: {cmd} (도움말: /help)")
+            
+        except Exception as e:
+            logger.error(f"명령어 처리 중 오류: {e}")
+
+    async def _check_commands(self):
+        """사용자 커맨드 큐 모니터링"""
+        while self.running:
+            try:
+                # 큐에서 커맨드 꺼내기 (Non-blocking)
+                try:
+                    cmd = self.user_cmd_queue.get_nowait()
+                    await self.process_user_command(cmd)
+                except queue.Empty:
+                    await asyncio.sleep(0.1)
+                    continue
+            except Exception as e:
+                logger.error(f"커맨드 처리 루프 오류: {e}")
+                await asyncio.sleep(1)
 
     async def _market_update_loop(self):
         """주기적으로 마켓 리스트 갱신"""
@@ -1735,6 +2319,11 @@ class MomentumTrader:
         """트레이딩 봇 시작"""
         logger.info("=" * 60)
         logger.info("🚀 모멘텀 트레이딩 봇 시작 (BTC 중심 전략)")
+        import websockets
+        # Debug logs removed
+        
+        # 커맨드 리스너 시작 (별도 스레드)
+        self.start_command_listener()
         
         # 1. 마켓 리스트 구성 (가장 먼저 실행)
         await self._update_top_markets()
@@ -1767,6 +2356,7 @@ class MomentumTrader:
                 self._private_ws_monitor(),
                 self._trading_loop(),
                 self._macro_update_loop(),
+                self._check_commands(),
                 self._balance_report_loop(),
                 self._market_update_loop(),
                 self._btc_monitor_loop()  # BTC 추세 모니터링 추가
@@ -2080,11 +2670,11 @@ class MomentumTrader:
                     analyzer = self.analyzers[market]
                     state = self.states[market]
                     
-                    # 거시 분석 결과 확인
-                    if analyzer.macro_trend == 'bearish':
-                        if not state.has_position():
-                             # 하락장에서는 관망 (로그는 너무 자주 찍히지 않게 조절 필요)
-                            continue
+                    # 거시 분석 결과 확인 (수정: 하락장 반등 기회를 잡기 위해 1차 차단 제거)
+                    # if analyzer.macro_trend == 'bearish':
+                    #     if not state.has_position():
+                    #          # 하락장에서는 관망 (로그는 너무 자주 찍히지 않게 조절 필요)
+                    #         continue
                     
                     if state.has_position():
                         # 포지션 관리
@@ -2093,18 +2683,40 @@ class MomentumTrader:
                         # 진입 기회 탐색
                         await self._find_entry(market)
                     
-                # 30초마다 분석 상태 로그 + 누적 수익률
+                # 10초마다 분석 상태 로그 + 누적 수익률
                 now = time.time()
-                if now - last_status_log >= 30:
+                if now - last_status_log >= ANALYSIS_INTERVAL:
                     last_status_log = now
                     
-                    # === 누적 수익률 출력 ===
+                    # === 누적 수익률 출력 (실현 + 미실현) ===
                     runtime = datetime.now() - self.start_time
                     runtime_str = str(runtime).split('.')[0]  # 소수점 제거
-                    profit_color = Color.GREEN if self.cumulative_profit >= 0 else Color.RED
-                    logger.info(f"💰 누적 수익: {profit_color}{self.cumulative_profit:+,.0f}원{Color.RESET} | "
-                              f"거래: {self.cumulative_trades}회 (승:{self.cumulative_wins}/패:{self.cumulative_losses}) | "
-                              f"실행시간: {runtime_str}")
+                    
+                    # 미실현 손익 계산 (보유 중인 종목)
+                    unrealized_profit = 0
+                    holding_count = 0
+                    for market in self.markets:
+                        state = self.states.get(market)
+                        if state and state.has_position():
+                            current_price = self.current_prices.get(market, 0)
+                            if current_price > 0:
+                                # 평가금액 - 매수금액
+                                val_value = current_price * state.position['volume']
+                                buy_value = state.entry_price * state.position['volume']
+                                # 수수료(0.05%) 고려한 대략적 순수익
+                                profit = val_value - buy_value - (val_value * 0.0005)
+                                unrealized_profit += profit
+                                holding_count += 1
+                                
+                    total_net_profit = self.cumulative_profit + unrealized_profit
+                    profit_color = Color.GREEN if total_net_profit >= 0 else Color.RED
+                    
+                    # 로그 메시지: 총 수익(실현+미실현) | 실현 수익 | 미실현 수익
+                    logger.info(f"💰 총 수익: {profit_color}{total_net_profit:+,.0f}원{Color.RESET} "
+                              f"(실현:{self.cumulative_profit:+,.0f} + 미실현:{unrealized_profit:+,.0f}) | "
+                              f"보유:{holding_count}종목 | "
+                              f"거래:{self.cumulative_trades}회(승{self.cumulative_wins}/패{self.cumulative_losses}) | "
+                              f"⏱️ {runtime_str}")
                     
                     for market in self.markets:
                         price = self.current_prices.get(market, 0)
@@ -2124,16 +2736,43 @@ class MomentumTrader:
                         fatigue = analyzer.fatigue_score
                         sentiment = analyzer.market_sentiment
                         
+                        # 1분/5분/15분봉 변화율 계산
+                        m1_change_display = 0
+                        m5_change_display = 0
+                        m15_change_display = 0
+                        
+                        if len(analyzer.minute_candles) >= 2:
+                            m1_start = analyzer.minute_candles[-2]['trade_price']
+                            m1_curr = analyzer.minute_candles[-1]['trade_price']
+                            m1_change_display = (m1_curr - m1_start) / m1_start * 100
+                        
+                        if len(analyzer.minute5_candles) >= 2:
+                            m5_start = analyzer.minute5_candles[-2]['trade_price']
+                            m5_curr = analyzer.minute5_candles[-1]['trade_price']
+                            m5_change_display = (m5_curr - m5_start) / m5_start * 100
+                        
+                        if len(analyzer.minute15_candles) >= 2:
+                            m15_start = analyzer.minute15_candles[-2]['trade_price']
+                            m15_curr = analyzer.minute15_candles[-1]['trade_price']
+                            m15_change_display = (m15_curr - m15_start) / m15_start * 100
+                        
+                        # 색상 코드 (상승: 빨강, 하락: 파랑)
+                        m1_color = Color.RED if m1_change_display >= 0 else Color.BLUE
+                        m5_color = Color.RED if m5_change_display >= 0 else Color.BLUE
+                        m15_color = Color.RED if m15_change_display >= 0 else Color.BLUE
+                        
                         # 매수/매도 비율
                         total_vol = analyzer.bid_volume_1m + analyzer.ask_volume_1m
                         buy_ratio = analyzer.bid_volume_1m / total_vol * 100 if total_vol > 0 else 50
                         
                         sentiment_emoji = "🟢" if sentiment == 'bullish' else ("🔴" if sentiment == 'bearish' else "🟡")
                         
-                        logger.info(f"[{market}] 📊 {price:,.0f}원 | "
-                                  f"분봉:{min_change:+.2f}% | "
-                                  f"RSI:{rsi:.0f} 피로:{fatigue:.0f} | "
-                                  f"매수:{buy_ratio:.0f}% | {sentiment_emoji}{sentiment}")
+                        logger.info(f"[{market:<11}] 📊 {price:>11,.0f}원 | "
+                                  f"1m:{m1_color}{m1_change_display:+6.2f}%{Color.RESET} "
+                                  f"5m:{m5_color}{m5_change_display:+6.2f}%{Color.RESET} "
+                                  f"15m:{m15_color}{m15_change_display:+6.2f}%{Color.RESET} | "
+                                  f"RSI:{rsi:>3.0f} 피로:{fatigue:>3.0f} | "
+                                  f"매수:{buy_ratio:>3.0f}% | {sentiment_emoji}{sentiment:<7}")
                 
                 await asyncio.sleep(1)  # 1초마다 체크
                 
@@ -2151,15 +2790,17 @@ class MomentumTrader:
                         # 거시 분석
                         self.analyzers[market].analyze_macro()
                         
-                        # 데이터 저장 (5분, 15분)
+                        # 데이터 저장 (1분, 5분, 15분)
                         # v3.3: 600개 이상 데이터 파일 저장으로 초기 로딩 속도 향상
                         an = self.analyzers[market]
+                        if an.minute_candles:
+                            an.save_candles_to_disk(1, an.minute_candles)
                         if an.minute5_candles:
                             an.save_candles_to_disk(5, an.minute5_candles)
                         if an.minute15_candles:
                             an.save_candles_to_disk(15, an.minute15_candles)
                             
-                    await asyncio.sleep(1.0) # 마켓 간 딜레이
+                    await asyncio.sleep(0.01) # 마켓 간 딜레이 최소화
             except Exception as e:
                 logger.error(f"거시 분석 업데이트 오류: {e}")
     
@@ -2177,7 +2818,7 @@ class MomentumTrader:
             # 마지막 청산가 대비 2% 이상 하락해야 재진입 허용
             min_reentry_price = state.last_exit_price * 0.98
             if current_price > min_reentry_price:
-                if int(time.time()) % 30 == 0:  # 30초에 한번 로그
+                if int(time.time()) % ANALYSIS_INTERVAL == 0:  # 10초에 한번 로그
                     logger.debug(f"[{market}] ⏳ 재진입 대기 - 현재가({current_price:,.0f}) > 재진입가({min_reentry_price:,.0f})")
                 return
         
@@ -2189,6 +2830,25 @@ class MomentumTrader:
 
             if USE_SECOND_CANDLES and len(analyzer.second_candles) < SECOND_MOMENTUM_WINDOW:
                  return
+            
+            # === [중요] 거시 추세 필터 (고점 하락 방지 & 물타기 방지) ===
+            if hasattr(analyzer, 'macro_result') and analyzer.macro_result:
+                mr = analyzer.macro_result
+                
+                # 1. 4시간봉 하락 추세 차단 (-0.5% 미만 하락 시 절대 진입 금지)
+                # 예외 없음: 안전성 최우선 (v3.5)
+                if mr.get('h4_change', 0) < -0.005:
+                     if int(time.time()) % 15 == 0:
+                         logger.debug(f"[{market}] 🚫 4시간 하락세({mr['h4_change']*100:.2f}%) - 진입 차단 (강제)")
+                     return
+
+                # 2. 3일 급등 후 조정 시 필터 (고점 부담)
+                if mr.get('daily_3d_change', 0) > 0.20: # 3일간 20% 이상 폭등 상태
+                     # 단기 모멘텀이 확실하지 않으면(+0.5% 미만) 진입 차단
+                     if mr.get('m5_change', 0) < 0.005: 
+                         if int(time.time()) % 15 == 0:
+                             logger.debug(f"[{market}] 🚫 3일 급등({mr['daily_3d_change']*100:.1f}%) 후 모멘텀 부족(5m < 0.5%) - 진입 차단")
+                         return
             
             # ==== 1단계: 종합 시장 심리 분석 (전문가 관점) ====
             sentiment = analyzer.analyze_market_sentiment()
@@ -2395,7 +3055,12 @@ class MomentumTrader:
         if current > state.highest_price:
             state.highest_price = current
             
-            # 트레일링 스탑 활성화 확인
+            # 1. 본절 스탑 (Break-even): +0.6% 도달 시 손절가를 매입가로 상향 (손실 방지)
+            if profit_rate >= BREAK_EVEN_TRIGGER and state.stop_loss_price < entry:
+                state.stop_loss_price = entry
+                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 🛡️ 본절 스탑 활성화! (수익 {profit_rate*100:.2f}% ≥ {BREAK_EVEN_TRIGGER*100:.1f}%) | 손절가: {state.stop_loss_price:,.0f}원 (매수가)")
+
+            # 2. 트레일링 스탑 활성화 확인
             if profit_rate >= TRAILING_STOP_ACTIVATION and not state.trailing_active:
                 state.trailing_active = True
                 # 최소 수익 보장선 설정 (매입가 + 최소 수익률)
@@ -2405,17 +3070,18 @@ class MomentumTrader:
                           f"수익률: {Color.GREEN}{profit_rate*100:.2f}%{Color.RESET} | "
                           f"최소 수익 보장: {Color.YELLOW}{TRAILING_MIN_PROFIT*100:.1f}%{Color.RESET}")
             
-            # 트레일링 스탑 가격 업데이트
-            if state.trailing_active:
-                new_stop = current * (1 - TRAILING_STOP_DISTANCE)
-                # 최소 수익 보장선보다 높을 때만 업데이트
-                min_profit_price = entry * (1 + TRAILING_MIN_PROFIT)
-                new_stop = max(new_stop, min_profit_price)
-                
-                if new_stop > state.stop_loss_price:
-                    old_stop = state.stop_loss_price
-                    state.stop_loss_price = new_stop
-                    logger.debug(f"[{Color.BOLD}{market}{Color.RESET}] 🔄 트레일링 스탑 갱신: {old_stop:,.0f} → {Color.RED}{new_stop:,.0f}원{Color.RESET}")
+        # 트레일링 스탑 가격 업데이트 (최고가 갱신과 무관하게 항상 체크하여 스탑 상향 가능하면 올림)
+        if state.trailing_active:
+            # 최고가 기준 트레일링
+            new_stop = state.highest_price * (1 - TRAILING_STOP_DISTANCE)
+            # 최소 수익 보장선보다 높을 때만 업데이트
+            min_profit_price = entry * (1 + TRAILING_MIN_PROFIT)
+            new_stop = max(new_stop, min_profit_price)
+            
+            if new_stop > state.stop_loss_price:
+                old_stop = state.stop_loss_price
+                state.stop_loss_price = new_stop
+                logger.debug(f"[{Color.BOLD}{market}{Color.RESET}] 🔄 트레일링 스탑 갱신: {old_stop:,.0f} → {Color.RED}{new_stop:,.0f}원{Color.RESET} (고점 {state.highest_price:,.0f}원 대비 -{TRAILING_STOP_DISTANCE*100:.1f}%)")
         
         # 매도 조건 체크
         sell_reason = None
@@ -2428,7 +3094,7 @@ class MomentumTrader:
                 sell_reason = 'stop_loss'
         
         # 2. 목표 수익률 도달 시 → 바로 익절하지 않고 트레일링 스탑 강화
-        elif profit_rate >= TAKE_PROFIT_TARGET:
+        elif current >= state.take_profit_price:
             if not state.trailing_active:
                 # 트레일링 스탑 활성화
                 state.trailing_active = True
@@ -2462,19 +3128,21 @@ class MomentumTrader:
                 profit_amount = eval_amount - buy_amount
                 profit_color = Color.GREEN if profit_amount >= 0 else Color.RED
                 
-                # 익절가 (트레일링 활성화 시)
-                take_profit_info = ""
+                # 익절가 (1차 목표) 계산
+                target_price = entry * (1 + TAKE_PROFIT_TARGET)
+                take_profit_msg = f" | 익절가: {Color.GREEN}{target_price:,.0f}원{Color.RESET}"
+                
                 if state.trailing_active:
-                    # 트레일링 스탑 거리로 익절가 계산 (고점 대비)
-                    take_profit_price = state.highest_price * (1 - TRAILING_STOP_DISTANCE)
-                    take_profit_info = f" | 익절가: {Color.GREEN}{take_profit_price:,.0f}원{Color.RESET}"
+                    # 트레일링 중에는 최소 수익 보장선이 중요
+                    min_profit = entry * (1 + TRAILING_MIN_PROFIT)
+                    take_profit_msg += f" (트레일링ON/보장:{min_profit:,.0f})"
                 
                 logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📈 보유 중 | 수량: {Color.CYAN}{volume:,.4f}{Color.RESET} | "
                           f"매수가: {Color.YELLOW}{entry:,.0f}원{Color.RESET} | 현재가: {Color.YELLOW}{current:,.0f}원{Color.RESET} | "
                           f"평가금액: {Color.CYAN}{eval_amount:,.0f}원{Color.RESET}")
                 logger.info(f"   수익률: {pnl_color}{pnl:+.2f}%{Color.RESET} | "
                           f"수익금: {profit_color}{profit_amount:+,.0f}원{Color.RESET} | "
-                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}{take_profit_info}")
+                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}{take_profit_msg}")
     
     
     def _sync_state_with_balance(self):
