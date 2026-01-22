@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 =================================================================================
 🚀 달리는 말에 올라타는 모멘텀 트레이딩 봇 (Momentum Riding Strategy)
@@ -188,17 +188,6 @@ logging.getLogger().addHandler(file_handler)
 
 logger = logging.getLogger(__name__)
 
-
-class Color:
-    """ANSI 색상 코드"""
-    RESET = "\033[0m"
-    RED = "\033[91m"
-    GREEN = "\033[92m"
-    YELLOW = "\033[93m"
-    BLUE = "\033[94m"
-    MAGENTA = "\033[95m"
-    CYAN = "\033[96m"
-    BOLD = "\033[1m"
 
 class UpbitAPI:
     """업비트 REST API 클라이언트"""
@@ -898,7 +887,7 @@ class MarketAnalyzer:
                     block_reason = block_reason or f"4시간봉 하락 ({h4_change*100:.2f}%)"
             elif strong_short_momentum and LONG_TERM_FILTER_ENABLED:
                 # 단기 급등 예외 로그
-                logger.info(f"[{self.market}] 🚀 단기 급등 감지 (5m:{m5_change*100:+.2f}% 1m일관:{m1_consistency_count}/3 4h:{h4_change*100:+.2f}% 매수:{buy_pressure*100:.1f}% 피로:{self.fatigue_score:.1f}) - 장기하락 차단 예외 적용")
+                logger.info(f"[{self.market}] 단기 급등 감지 (5m:{m5_change*100:+.2f}% 1m일관:{m1_consistency_count}/3 4h:{h4_change*100:+.2f}% 매수:{buy_pressure*100:.1f}% 피로:{self.fatigue_score:.1f}) - 장기하락 차단 예외 적용")
             
             # 종합 점수 계산 (v3.2: 장기 가중치 강화)
             # 15분(20%) + 30분(15%) + 1시간(20%) + 4시간(25%) + 1일(20%)
@@ -913,7 +902,7 @@ class MarketAnalyzer:
                 trend = 'bearish'
                 can_trade = False
                 if short_squeeze and IGNORE_SHORT_SQUEEZE_IN_DOWNTREND:
-                    logger.warning(f"[{self.market}] 🚫 하락장 반등 무시 | {block_reason} | Short Squeeze 신호 차단")
+                    logger.warning(f"[{self.market}] 하락장 반등 무시 | {block_reason} | Short Squeeze 신호 차단")
             elif score < MACRO_MIN_CHANGE_RATE and not short_squeeze:
                 trend = 'bearish'
                 can_trade = False
@@ -948,25 +937,19 @@ class MarketAnalyzer:
             self.macro_result = result  # [핵심] 상세 분석 결과 저장
             
             # 색상 코드 지정
-            m5_color = Color.RED if m5_change >= 0 else Color.BLUE
-            m15_color = Color.RED if m15_change >= 0 else Color.BLUE
-            h4_color = Color.RED if h4_change >= 0 else Color.BLUE
-            d_color = Color.RED if daily_change >= 0 else Color.BLUE
-            d3_color = Color.RED if daily_3d_change >= 0 else Color.BLUE
-
-            log_msg = (f"[{self.market:<11}] 📊 추세 분석 | {trend:<7} | "
-                      f"5m:{m5_color}{m5_change*100:>+6.2f}%{Color.RESET} "
-                      f"15m:{m15_color}{m15_change*100:>+6.2f}%{Color.RESET} "
-                      f"4h:{h4_color}{h4_change*100:>+6.2f}%{Color.RESET} "
-                      f"일:{d_color}{daily_change*100:>+6.2f}%{Color.RESET} "
-                      f"3일:{d3_color}{daily_3d_change*100:>+6.2f}%{Color.RESET}")
+            log_msg = (f"[{self.market:<11}] 추세 분석 | {trend:<7} | "
+                      f"5m:{m5_change*100:>+6.2f}% "
+                      f"15m:{m15_change*100:>+6.2f}% "
+                      f"4h:{h4_change*100:>+6.2f}% "
+                      f"일:{daily_change*100:>+6.2f}% "
+                      f"3일:{daily_3d_change*100:>+6.2f}%")
 
             if long_term_bearish:
-                log_msg += f" | 🚫 장기하락 차단"
+                log_msg += f" | 장기하락 차단"
             elif strong_short_momentum:
-                log_msg += f" | 🚀 단기 급등 (예외 허용, 1m일관:{m1_consistency_count}/3, 매수:{buy_pressure*100:.0f}%)"
+                log_msg += f" | 단기 급등 (예외 허용, 1m일관:{m1_consistency_count}/3, 매수:{buy_pressure*100:.0f}%)"
             elif short_squeeze:
-                log_msg += " | 🔥 Short Squeeze"
+                log_msg += " | Short Squeeze"
             logger.info(log_msg)
             
             return result
@@ -1287,7 +1270,7 @@ class MarketAnalyzer:
         # === 4. 급등 피로도 분석 ===
         if self.fatigue_score >= 60:
             score -= 25
-            analysis['warnings'].append(f"🔥 급등 피로도 높음 ({self.fatigue_score:.1f}) - 조정 가능성")
+            analysis['warnings'].append(f"급등 피로도 높음 ({self.fatigue_score:.1f}) - 조정 가능성")
         elif self.fatigue_score >= 40:
             score -= 12
             analysis['warnings'].append(f"급등 피로감 ({self.fatigue_score:.1f})")
@@ -1347,7 +1330,7 @@ class MarketAnalyzer:
         # === [v3.2] 거시 추세 하락 시 무조건 차단 ===
         if self.macro_trend == 'bearish':
             result['valid_entry'] = False
-            result['warnings'].append("🚫 거시 추세 하락 (일봉/4시간봉) - 진입 차단")
+            result['warnings'].append("거시 추세 하락 (일봉/4시간봉) - 진입 차단")
             return result
         
         # === 1. 5분봉 분석 ===
@@ -1402,7 +1385,7 @@ class MarketAnalyzer:
                 else:
                     # 완만한 하락이거나 약한 하락세 -> 진입 금지 (가장 위험한 구간)
                     result['valid_entry'] = False
-                    result['warnings'].append(f"🚫 하락추세 진행중 (이격부족:{disparity*100:.1f}%)")
+                    result['warnings'].append(f"하락추세 진행중 (이격부족:{disparity*100:.1f}%)")
             
             # 정배열일 경우
             elif ma15 > 0 and ma50 > 0:
@@ -1480,7 +1463,7 @@ class MarketAnalyzer:
                 result['reasons'].append(f"15분봉 상승 ({change_15m*100:.2f}%)")
             elif change_15m <= -MTF_15M_TREND_THRESHOLD:
                 result['trend_15m'] = 'bearish'
-                result['warnings'].append(f"🚫 15분봉 하락 ({change_15m*100:.2f}%)")
+                result['warnings'].append(f"15분봉 하락 ({change_15m*100:.2f}%)")
                 if MTF_STRICT_MODE:
                     result['valid_entry'] = False
             else:
@@ -1497,7 +1480,7 @@ class MarketAnalyzer:
                 result['warnings'].append(f"최근 5분봉 {down_count}개 음봉")
                 if down_count == 3:
                     result['valid_entry'] = False
-                    result['warnings'].append("🚫 3연속 음봉 - 진입 차단")
+                    result['warnings'].append("3연속 음봉 - 진입 차단")
         
         return result
 
@@ -1621,7 +1604,7 @@ class MarketAnalyzer:
         if sec_momentum_ok:
             reason.append(f"초봉모멘텀 {sec_price_change*100:.3f}%")
         if rapid_rise:
-            reason.append(f"🚀급등 {rapid_change*100:.3f}%")
+            reason.append(f"급등 {rapid_change*100:.3f}%")
         if sec_volume_ok:
             reason.append(f"초봉거래량 {sec_volume_ratio:.1f}배")
         if sec_up_count >= 3:
@@ -1683,7 +1666,7 @@ class MarketAnalyzer:
                 'mtf_trend_5m': mtf_result.get('trend_5m', 'neutral'),
                 'mtf_trend_15m': mtf_result.get('trend_15m', 'neutral'),
                 'mtf_blocked': True,
-                'reason': f'🚫 호가불균형 차단 (매도우위:{orderbook_imbalance:.2f})'
+                'reason': f'호가불균형 차단 (매도우위:{orderbook_imbalance:.2f})'
             }
         
         # === 1단계: 기존 1분봉/초봉 신호 확인 ===
@@ -1745,7 +1728,7 @@ class MarketAnalyzer:
             if mtf_result.get('trend_5m') == 'bearish':
                 combined_signal = False
                 mtf_blocked = True
-                reasons.append(f"🚫 5분봉 하락추세 ({mtf_result.get('change_5m',0)*100:.2f}%)")
+                reasons.append(f"5분봉 하락추세 ({mtf_result.get('change_5m',0)*100:.2f}%)")
             
             # 1-1. 5분봉 모멘텀 약화 감지 (신규 추가)
             # 최근 5분봉 변화율이 감소 추세면 진입 보류
@@ -1767,19 +1750,19 @@ class MarketAnalyzer:
                     if prev_momentum > 0.003 and last_momentum < prev_momentum * 0.5:
                         combined_signal = False
                         mtf_blocked = True
-                        reasons.append(f"🚫 5분봉 모멘텀 약화 ({prev_momentum*100:.2f}% → {last_momentum*100:.2f}%)")
+                        reasons.append(f"5분봉 모멘텀 약화 ({prev_momentum*100:.2f}% → {last_momentum*100:.2f}%)")
             
             # 2. 1분봉 과도한 급등 차단 (고점 추격 방지)
             elif minute_result.get('price_change', 0) >= MTF_MAX_1M_CHANGE:
                 combined_signal = False
                 mtf_blocked = True
-                reasons.append(f"🚫 1분봉 과도한 급등 ({minute_result.get('price_change',0)*100:.2f}%) - 고점 위험")
+                reasons.append(f"1분봉 과도한 급등 ({minute_result.get('price_change',0)*100:.2f}%) - 고점 위험")
             
             # 3. MTF 분석 결과에 따른 진입 차단/허용
             elif not mtf_result['valid_entry']:
                 combined_signal = False
                 mtf_blocked = True
-                reasons.append(f"🚫 MTF 차단: {' | '.join(mtf_result['warnings'])}")
+                reasons.append(f"MTF 차단: {' | '.join(mtf_result['warnings'])}")
             else:
                 # 상승 단계에 따른 강도 조정
                 stage = mtf_result.get('stage', 'unknown')
@@ -1799,13 +1782,13 @@ class MarketAnalyzer:
                     if combined_strength < 90:
                         combined_signal = False
                         mtf_blocked = True
-                        reasons.append(f"🚫 상승중반 강도부족 ({combined_strength:.1f}<90) - 타이밍 늦음")
+                        reasons.append(f"상승중반 강도부족 ({combined_strength:.1f}<90) - 타이밍 늦음")
                     else:
                         reasons.append(f"📈 상승중반")
                 elif stage == 'late':
                     combined_signal = False  # 후반 진입 차단
                     mtf_blocked = True
-                    reasons.append(f"🚫 상승후반 - 진입차단")
+                    reasons.append(f"상승후반 - 진입차단")
                 
                 if combined_signal:
                     # 거래량 확인 보너스
@@ -1820,13 +1803,13 @@ class MarketAnalyzer:
                         if MTF_STRICT_MODE:
                             combined_signal = False
                             mtf_blocked = True
-                            reasons.append(f"🚫 15분봉 하락추세")
+                            reasons.append(f"15분봉 하락추세")
         
         # === 3단계: 최소 신호 강도 체크 (v3.1 추가) ===
         if combined_signal and combined_strength < MIN_SIGNAL_STRENGTH:
             combined_signal = False
             mtf_blocked = True
-            reasons.append(f"🚫 최소 강도 미달 ({combined_strength:.0f}<{MIN_SIGNAL_STRENGTH})")
+            reasons.append(f"최소 강도 미달 ({combined_strength:.0f}<{MIN_SIGNAL_STRENGTH})")
         
         return {
             'signal': combined_signal,
@@ -2055,7 +2038,7 @@ class MomentumTrader:
                     # patch_stdout 컨텍스트 내에서 prompt 실행
                     # 이렇게 하면 로그가 prompt 위로 출력됨
                     with patch_stdout(raw=True):  # raw=True는 ANSI 코드 처리 도움
-                        command = session.prompt("USER_CMD> ")
+                        command = session.prompt("> ")
                         
                         if command:
                             self.user_cmd_queue.put(command.strip())
@@ -2216,7 +2199,7 @@ class MomentumTrader:
                      
                      trend_emoji = "🔴" if self.analyzers[market].macro_trend == 'bearish' else "🟢" if self.analyzers[market].macro_trend == 'bullish' else "🟡"
                      
-                     logger.info(f"📊 {market} 추세 분석 결과: {trend_emoji} {self.analyzers[market].macro_trend.upper()}")
+                     logger.info(f"{market} 추세 분석 결과: {trend_emoji} {self.analyzers[market].macro_trend.upper()}")
                      logger.info(f"   스코어: {self.analyzers[market].macro_score:.2f}")
                      logger.info(f"   변화율: 5m({mr.get('m5_change',0)*100:+.2f}%) 15m({mr.get('m15_change',0)*100:+.2f}%) 4h({mr.get('h4_change',0)*100:+.2f}%)")
                  else:
@@ -2318,7 +2301,7 @@ class MomentumTrader:
     async def start(self):
         """트레이딩 봇 시작"""
         logger.info("=" * 60)
-        logger.info("🚀 모멘텀 트레이딩 봇 시작 (BTC 중심 전략)")
+        logger.info("모멘텀 트레이딩 봇 시작 (BTC 중심 전략)")
         import websockets
         # Debug logs removed
         
@@ -2335,7 +2318,7 @@ class MomentumTrader:
         logger.info(f"   타겟 마켓: {len(self.markets)}개 종목 (Top {TOP_MARKET_COUNT} + 보유)")
         logger.info(f"   최대 투자금: {MAX_INVESTMENT:,}원")
         logger.info(f"   테스트 모드: {'ON' if DRY_RUN else 'OFF'}")
-        logger.info(f"   📊 BTC 중심 시장 분석: 활성화")
+        logger.info(f"   BTC 중심 시장 분석: 활성화")
         logger.info(f"   📝 거래 기록 파일: {TRADE_LOG_FILE}")
         logger.info("=" * 60)
         
@@ -2396,8 +2379,8 @@ class MomentumTrader:
                 trend_emoji = "🟢" if self.btc_trend == 'bullish' else ("🔴" if self.btc_trend == 'bearish' else "🟡")
                 safe_status = "✅ 진입가능" if self.market_safe else "⛔ 진입중단"
                 block_status = "[BTC차단:ON]" if BTC_DOWNTREND_BUY_BLOCK else "[BTC차단:OFF]"
-                logger.info(f"[{BTC_MARKET}] {trend_emoji} BTC 추세: {self.btc_trend.upper()} | "
-                          f"1시간 변화: {Color.YELLOW}{btc_change*100:+.2f}%{Color.RESET} | {safe_status} {block_status}")
+                logger.info(f"[{BTC_MARKET}] BTC 추세: {self.btc_trend.upper()} | "
+                          f"1시간 변화: {btc_change*100:+.2f}% | {safe_status} {block_status}")
                 
         except Exception as e:
             logger.error(f"BTC 추세 확인 오류: {e}")
@@ -2438,7 +2421,7 @@ class MomentumTrader:
                 krw = self.assets['KRW']
                 balance = krw['balance']
                 locked = krw['locked']
-                logger.info(f"💰 KRW 잔고: {Color.YELLOW}{balance:,.0f}원{Color.RESET} (주문가능: {Color.YELLOW}{balance-locked:,.0f}원{Color.RESET})")
+                logger.info(f"KRW 잔고: {balance:,.0f}원 (주문가능: {balance-locked:,.0f}원)")
             
             # 보유 자산별 평가금액 계산
             total_valuation = 0.0
@@ -2472,16 +2455,13 @@ class MomentumTrader:
                 if avg_buy_price > 0:
                      profit_rate = (current_price - avg_buy_price) / avg_buy_price * 100
                 
-                # 수익률 색상
-                pnl_color = Color.GREEN if profit_rate >= 0 else Color.RED
-                
-                logger.info(f"🪙 {Color.BOLD}{currency}{Color.RESET} | "
-                          f"보유: {Color.YELLOW}{total_balance:,.8f}{Color.RESET} | "
-                          f"평단: {Color.YELLOW}{avg_buy_price:,.0f}원{Color.RESET} | "
-                          f"현재: {Color.YELLOW}{current_price:,.0f}원{Color.RESET} | "
-                          f"평가: {Color.YELLOW}{valuation:,.0f}원{Color.RESET} ({pnl_color}{profit_rate:+.2f}%{Color.RESET})")
+                logger.info(f"{currency} | "
+                          f"보유: {total_balance:,.8f} | "
+                          f"평단: {avg_buy_price:,.0f}원 | "
+                          f"현재: {current_price:,.0f}원 | "
+                          f"평가: {valuation:,.0f}원 ({profit_rate:+.2f}%)")
                           
-            logger.info(f"💵 총 자산 추정: {Color.YELLOW}{self.assets.get('KRW', {}).get('balance', 0) + total_valuation:,.0f}원{Color.RESET}")
+            logger.info(f"총 자산 추정: {self.assets.get('KRW', {}).get('balance', 0) + total_valuation:,.0f}원")
             
         except Exception as e:
             logger.error(f"잔고 확인 실패: {e}")
@@ -2709,10 +2689,8 @@ class MomentumTrader:
                                 holding_count += 1
                                 
                     total_net_profit = self.cumulative_profit + unrealized_profit
-                    profit_color = Color.GREEN if total_net_profit >= 0 else Color.RED
-                    
                     # 로그 메시지: 총 수익(실현+미실현) | 실현 수익 | 미실현 수익
-                    logger.info(f"💰 총 수익: {profit_color}{total_net_profit:+,.0f}원{Color.RESET} "
+                    logger.info(f"총 수익: {total_net_profit:+,.0f}원 "
                               f"(실현:{self.cumulative_profit:+,.0f} + 미실현:{unrealized_profit:+,.0f}) | "
                               f"보유:{holding_count}종목 | "
                               f"거래:{self.cumulative_trades}회(승{self.cumulative_wins}/패{self.cumulative_losses}) | "
@@ -2756,10 +2734,6 @@ class MomentumTrader:
                             m15_curr = analyzer.minute15_candles[-1]['trade_price']
                             m15_change_display = (m15_curr - m15_start) / m15_start * 100
                         
-                        # 색상 코드 (상승: 빨강, 하락: 파랑)
-                        m1_color = Color.RED if m1_change_display >= 0 else Color.BLUE
-                        m5_color = Color.RED if m5_change_display >= 0 else Color.BLUE
-                        m15_color = Color.RED if m15_change_display >= 0 else Color.BLUE
                         
                         # 매수/매도 비율
                         total_vol = analyzer.bid_volume_1m + analyzer.ask_volume_1m
@@ -2767,12 +2741,14 @@ class MomentumTrader:
                         
                         sentiment_emoji = "🟢" if sentiment == 'bullish' else ("🔴" if sentiment == 'bearish' else "🟡")
                         
-                        logger.info(f"[{market:<11}] 📊 {price:>11,.0f}원 | "
-                                  f"1m:{m1_color}{m1_change_display:+6.2f}%{Color.RESET} "
-                                  f"5m:{m5_color}{m5_change_display:+6.2f}%{Color.RESET} "
-                                  f"15m:{m15_color}{m15_change_display:+6.2f}%{Color.RESET} | "
+                        if market == self.markets[0]:
+                            logger.info("------------------------------------")
+                        logger.info(f"[{market:<11}] {price:>11,.0f}원 | "
+                                  f"1m:{m1_change_display:>6.2f}% "
+                                  f"5m:{m5_change_display:>6.2f}% "
+                                  f"15m:{m15_change_display:>6.2f}% | "
                                   f"RSI:{rsi:>3.0f} 피로:{fatigue:>3.0f} | "
-                                  f"매수:{buy_ratio:>3.0f}% | {sentiment_emoji}{sentiment:<7}")
+                                  f"매수:{buy_ratio:>3.0f}% | {sentiment:<7}")
                 
                 await asyncio.sleep(1)  # 1초마다 체크
                 
@@ -2839,7 +2815,7 @@ class MomentumTrader:
                 # 예외 없음: 안전성 최우선 (v3.5)
                 if mr.get('h4_change', 0) < -0.005:
                      if int(time.time()) % 15 == 0:
-                         logger.debug(f"[{market}] 🚫 4시간 하락세({mr['h4_change']*100:.2f}%) - 진입 차단 (강제)")
+                         logger.debug(f"[{market}] 4시간 하락세({mr['h4_change']*100:.2f}%) - 진입 차단 (강제)")
                      return
 
                 # 2. 3일 급등 후 조정 시 필터 (고점 부담)
@@ -2847,7 +2823,7 @@ class MomentumTrader:
                      # 단기 모멘텀이 확실하지 않으면(+0.5% 미만) 진입 차단
                      if mr.get('m5_change', 0) < 0.005: 
                          if int(time.time()) % 15 == 0:
-                             logger.debug(f"[{market}] 🚫 3일 급등({mr['daily_3d_change']*100:.1f}%) 후 모멘텀 부족(5m < 0.5%) - 진입 차단")
+                             logger.debug(f"[{market}] 3일 급등({mr['daily_3d_change']*100:.1f}%) 후 모멘텀 부족(5m < 0.5%) - 진입 차단")
                          return
             
             # ==== 1단계: 종합 시장 심리 분석 (전문가 관점) ====
@@ -2858,7 +2834,7 @@ class MomentumTrader:
                 # 상세 경고 로그 (10초에 1번만)
                 if int(time.time()) % 10 == 0:
                     warnings = ' | '.join(sentiment.get('warnings', []))
-                    logger.debug(f"[{market}] 🚫 진입 차단 - 부정적 심리 (점수:{sentiment['score']:.0f})")
+                    logger.debug(f"[{market}] 진입 차단 - 부정적 심리 (점수:{sentiment['score']:.0f})")
                     if warnings:
                         logger.debug(f"   경고: {warnings}")
                 return
@@ -2877,7 +2853,7 @@ class MomentumTrader:
             # ==== 3단계: 피로도/과매수 시 추가 필터링 (강화) ====
             if very_overbought:
                 # RSI 75 이상: 진입 차단
-                logger.info(f"[{market}] 🚫 극심한 과매수 (RSI:{sentiment['rsi']:.0f}) - 진입 차단")
+                logger.info(f"[{market}] 극심한 과매수 (RSI:{sentiment['rsi']:.0f}) - 진입 차단")
                 return
                 
             if high_fatigue or overbought:
@@ -2908,11 +2884,11 @@ class MomentumTrader:
             mtf_stage_icon = {'early': '🟢초기', 'mid': '🟡중반', 'late': '🔴후반', 'neutral': '⚪중립'}.get(mtf_stage, '❓')
             mtf_trend_info = f"5m:{momentum.get('mtf_trend_5m', '-')} 15m:{momentum.get('mtf_trend_15m', '-')}"
             
-            logger.info(f"[{Color.BOLD}{market}{Color.RESET}] {rapid_indicator} 진입 신호 확정!")
+            logger.info(f"[{market}] {rapid_indicator} 진입 신호 확정!")
             logger.info(f"   {momentum['reason']}")
-            logger.info(f"   강도:{Color.MAGENTA}{momentum['strength']:.1f}{Color.RESET} | {sentiment_info} | {trade_ratio_info}")
+            logger.info(f"   강도:{momentum['strength']:.1f} | {sentiment_info} | {trade_ratio_info}")
             logger.info(f"   RSI:{sentiment['rsi']:.1f} | 피로도:{sentiment['fatigue']:.1f} | 호가불균형:{sentiment['orderbook_imbalance']:.2f}")
-            logger.info(f"   📊 MTF: {mtf_stage_icon} | {mtf_trend_info}")
+            logger.info(f"   MTF: {mtf_stage_icon} | {mtf_trend_info}")
             
             await self._execute_buy(market)
                 
@@ -2937,14 +2913,14 @@ class MomentumTrader:
             invest_amount = min(MAX_INVESTMENT, krw_balance * 0.99)  # 99%만 사용 (수수료 대비)
             
             if invest_amount < MIN_ORDER_AMOUNT:
-                logger.warning(f"잔고 부족: {Color.YELLOW}{krw_balance:,.0f}원{Color.RESET}")
+                logger.warning(f"잔고 부족: {krw_balance:,.0f}원")
                 return
             
             current_price = self.current_prices[market]
             
             if DRY_RUN:
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 🛒 [테스트] 시장가 매수 | 금액: {Color.YELLOW}{invest_amount:,.0f}원{Color.RESET} | "
-                          f"현재가: {Color.YELLOW}{current_price:,.0f}원{Color.RESET}")
+                logger.info(f"[{market}] [테스트] 시장가 매수 | 금액: {invest_amount:,.0f}원 | "
+                          f"현재가: {current_price:,.0f}원")
                 # 테스트 모드에서는 가상 포지션 생성
                 state = self.states[market]
                 state.position = {
@@ -2961,8 +2937,8 @@ class MomentumTrader:
                     ord_type='price',  # 시장가 매수
                     price=str(int(invest_amount))
                 )
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 🛒 시장가 매수 주문 요청 | UUID: {result['uuid']} | "
-                          f"금액: {Color.YELLOW}{invest_amount:,.0f}원{Color.RESET}")
+                logger.info(f"[{market}] 시장가 매수 주문 요청 | UUID: {result['uuid']} | "
+                          f"금액: {invest_amount:,.0f}원")
                 
                 # 체결 대기 (Polling 제거 -> WebSocket myOrder로 확인해야 정확하지만)
                 # 시장가 주문은 거의 즉시 체결되므로, 여기서는 잠시 대기 후 state 업데이트를 기다림
@@ -3030,10 +3006,10 @@ class MomentumTrader:
                 
                 stat_msg = f"1분:{m1_change:+.2f}% | RSI:{rsi:.0f} | 피로:{fatigue:.0f} | 매수:{buy_ratio:.0f}%"
 
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] ✅ 매수 체결 | 가격: {Color.YELLOW}{state.entry_price:,.0f}원{Color.RESET} | "
-                          f"매수금액: {Color.YELLOW}{invest_amount:,.0f}원{Color.RESET} | "
-                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET} | "
-                          f"익절가: {Color.GREEN}{state.take_profit_price:,.0f}원{Color.RESET} | "
+                logger.info(f"[{market}] 매수 체결 | 가격: {state.entry_price:,.0f}원 | "
+                          f"매수금액: {invest_amount:,.0f}원 | "
+                          f"손절가: {state.stop_loss_price:,.0f}원 | "
+                          f"익절가: {state.take_profit_price:,.0f}원 | "
                           f"{stat_msg}")
                 
         except Exception as e:
@@ -3058,7 +3034,7 @@ class MomentumTrader:
             # 1. 본절 스탑 (Break-even): +0.6% 도달 시 손절가를 매입가로 상향 (손실 방지)
             if profit_rate >= BREAK_EVEN_TRIGGER and state.stop_loss_price < entry:
                 state.stop_loss_price = entry
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 🛡️ 본절 스탑 활성화! (수익 {profit_rate*100:.2f}% ≥ {BREAK_EVEN_TRIGGER*100:.1f}%) | 손절가: {state.stop_loss_price:,.0f}원 (매수가)")
+                logger.info(f"[{market}] 본절 스탑 활성화! (수익 {profit_rate*100:.2f}% ≥ {BREAK_EVEN_TRIGGER*100:.1f}%) | 손절가: {state.stop_loss_price:,.0f}원 (매수가)")
 
             # 2. 트레일링 스탑 활성화 확인
             if profit_rate >= TRAILING_STOP_ACTIVATION and not state.trailing_active:
@@ -3066,9 +3042,9 @@ class MomentumTrader:
                 # 최소 수익 보장선 설정 (매입가 + 최소 수익률)
                 min_profit_price = entry * (1 + TRAILING_MIN_PROFIT)
                 state.stop_loss_price = max(state.stop_loss_price, min_profit_price)
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📊 트레일링 스탑 활성화 | "
-                          f"수익률: {Color.GREEN}{profit_rate*100:.2f}%{Color.RESET} | "
-                          f"최소 수익 보장: {Color.YELLOW}{TRAILING_MIN_PROFIT*100:.1f}%{Color.RESET}")
+                logger.info(f"[{market}] 트레일링 스탑 활성화 | "
+                          f"수익률: {profit_rate*100:.2f}% | "
+                          f"최소 수익 보장: {TRAILING_MIN_PROFIT*100:.1f}%")
             
         # 트레일링 스탑 가격 업데이트 (최고가 갱신과 무관하게 항상 체크하여 스탑 상향 가능하면 올림)
         if state.trailing_active:
@@ -3081,7 +3057,7 @@ class MomentumTrader:
             if new_stop > state.stop_loss_price:
                 old_stop = state.stop_loss_price
                 state.stop_loss_price = new_stop
-                logger.debug(f"[{Color.BOLD}{market}{Color.RESET}] 🔄 트레일링 스탑 갱신: {old_stop:,.0f} → {Color.RED}{new_stop:,.0f}원{Color.RESET} (고점 {state.highest_price:,.0f}원 대비 -{TRAILING_STOP_DISTANCE*100:.1f}%)")
+                logger.debug(f"[{market}] 트레일링 스탑 갱신: {old_stop:,.0f} → {new_stop:,.0f}원 (고점 {state.highest_price:,.0f}원 대비 -{TRAILING_STOP_DISTANCE*100:.1f}%)")
         
         # 매도 조건 체크
         sell_reason = None
@@ -3117,7 +3093,6 @@ class MomentumTrader:
             # 상태 로깅 (10초마다)
             if int(time.time()) % 10 == 0:
                 pnl = profit_rate * 100
-                pnl_color = Color.GREEN if pnl >= 0 else Color.RED
                 volume = state.position.get('volume', 0)
                 
                 # 평가금액 계산 (수량 × 현재가)
@@ -3126,23 +3101,22 @@ class MomentumTrader:
                 buy_amount = volume * entry
                 # 수익금 계산
                 profit_amount = eval_amount - buy_amount
-                profit_color = Color.GREEN if profit_amount >= 0 else Color.RED
                 
                 # 익절가 (1차 목표) 계산
                 target_price = entry * (1 + TAKE_PROFIT_TARGET)
-                take_profit_msg = f" | 익절가: {Color.GREEN}{target_price:,.0f}원{Color.RESET}"
+                take_profit_msg = f" | 익절가: {target_price:,.0f}원"
                 
                 if state.trailing_active:
                     # 트레일링 중에는 최소 수익 보장선이 중요
                     min_profit = entry * (1 + TRAILING_MIN_PROFIT)
                     take_profit_msg += f" (트레일링ON/보장:{min_profit:,.0f})"
                 
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] 📈 보유 중 | 수량: {Color.CYAN}{volume:,.4f}{Color.RESET} | "
-                          f"매수가: {Color.YELLOW}{entry:,.0f}원{Color.RESET} | 현재가: {Color.YELLOW}{current:,.0f}원{Color.RESET} | "
-                          f"평가금액: {Color.CYAN}{eval_amount:,.0f}원{Color.RESET}")
-                logger.info(f"   수익률: {pnl_color}{pnl:+.2f}%{Color.RESET} | "
-                          f"수익금: {profit_color}{profit_amount:+,.0f}원{Color.RESET} | "
-                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}{take_profit_msg}")
+                logger.info(f"[{market}] 보유 중 | 수량: {volume:,.4f} | "
+                          f"매수가: {entry:,.0f}원 | 현재가: {current:,.0f}원 | "
+                          f"평가금액: {eval_amount:,.0f}원")
+                logger.info(f"   수익률: {pnl:+.2f}% | "
+                          f"수익금: {profit_amount:+,.0f}원 | "
+                          f"손절가: {state.stop_loss_price:,.0f}원{take_profit_msg}")
     
     
     def _sync_state_with_balance(self):
@@ -3245,9 +3219,9 @@ class MomentumTrader:
                 state.take_profit_price = entry_price * (1 + TAKE_PROFIT_TARGET)
                 state.trailing_active = False
                 
-                logger.info(f"[{Color.BOLD}{market}{Color.RESET}] ✅ 상태 복구 완료 | 진입가: {Color.YELLOW}{entry_price:,.0f}원{Color.RESET} | "
-                          f"수량: {Color.YELLOW}{balance:,.8f}{Color.RESET} | "
-                          f"손절가: {Color.RED}{state.stop_loss_price:,.0f}원{Color.RESET}")
+                logger.info(f"[{market}] 상태 복구 완료 | 진입가: {entry_price:,.0f}원 | "
+                          f"수량: {balance:,.8f} | "
+                          f"손절가: {state.stop_loss_price:,.0f}원")
                 
             except Exception as e:
                 logger.error(f"[{market}] 상태 동기화 실패: {e}")
@@ -3348,9 +3322,6 @@ class MomentumTrader:
             state.position = None
             state.trailing_active = False
             
-            emoji = "🎉" if profit >= 0 else "📉"
-            pnl_color = Color.GREEN if profit >= 0 else Color.RED
-            cum_color = Color.GREEN if self.cumulative_profit >= 0 else Color.RED
             # 지표 요약
             analyzer = self.analyzers[market]
             rsi = analyzer.rsi_value
@@ -3370,12 +3341,12 @@ class MomentumTrader:
             
             stat_msg = f"1분:{m1_change:+.2f}% | RSI:{rsi:.0f} | 피로:{fatigue:.0f} | 매수:{buy_ratio:.0f}%"
 
-            logger.info(f"[{Color.BOLD}{market}{Color.RESET}] {emoji} 매도 완료 | 사유: {reason} | "
-                       f"매도금액: {Color.YELLOW}{sell_amount:,.0f}원{Color.RESET} | "
-                       f"수익: {pnl_color}{profit:+,.0f}원 ({profit_rate:+.2f}%){Color.RESET} | "
-                       f"매도가: {Color.YELLOW}{executed_price:,.0f}원{Color.RESET}")
-            logger.info(f"   📊 판단기준: {stat_msg}")
-            logger.info(f"💰 누적 수익: {cum_color}{self.cumulative_profit:+,.0f}원{Color.RESET} | "
+            logger.info(f"[{market}] 매도 완료 | 사유: {reason} | "
+                       f"매도금액: {sell_amount:,.0f}원 | "
+                       f"수익: {profit:+,.0f}원 ({profit_rate:+.2f}%) | "
+                       f"매도가: {executed_price:,.0f}원")
+            logger.info(f"   판단기준: {stat_msg}")
+            logger.info(f"누적 수익: {self.cumulative_profit:+,.0f}원 | "
                        f"총 {self.cumulative_trades}회 거래 (승:{self.cumulative_wins}/패:{self.cumulative_losses})")
             
         except Exception as e:
@@ -3392,7 +3363,7 @@ class MomentumTrader:
         runtime_str = str(runtime).split('.')[0]
         
         logger.info("=" * 60)
-        logger.info("📊 전체 거래 요약")
+        logger.info("전체 거래 요약")
         logger.info(f"   실행 시간: {runtime_str}")
         logger.info("=" * 60)
         

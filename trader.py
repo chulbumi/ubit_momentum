@@ -418,7 +418,11 @@ class MomentumTrader:
                     total_asset += balance_krw
                 
                 logger.info("보유 종목:")
-                for market, state in self.states.items():
+                # self.markets에 있는 마켓 먼저 표시
+                for market in self.markets:
+                    if market not in self.states:
+                        continue
+                    state = self.states[market]
                     if state.has_position():
                         currency = market.split('-')[1]
                         current_price = self.current_prices.get(market, 0)
@@ -487,6 +491,46 @@ class MomentumTrader:
                                       f"수익금: {profit_amount:+,.0f}원 | "
                                       f"손절가: {state.stop_loss_price:,.0f}원{take_profit_msg}")
                 
+                # self.markets에 없지만 self.states에 있는 보유 종목도 표시 (수동 매수 등)
+                for market, state in self.states.items():
+                    if market in self.markets:
+                        continue  # 이미 위에서 처리됨
+                    if state.has_position():
+                        currency = market.split('-')[1]
+                        current_price = self.current_prices.get(market, 0)
+                        
+                        if current_price <= 0:
+                            continue
+                        
+                        # 가상 구매만 표시 (assets에 없으면 가상 구매)
+                        if currency not in self.assets and state.position:
+                            volume = state.position.get('volume', 0)
+                            if volume <= 0:
+                                continue
+                            
+                            entry_price = state.entry_price if state.entry_price > 0 else state.position.get('price', current_price)
+                            eval_amount = volume * current_price
+                            buy_amount = volume * entry_price
+                            profit_amount = eval_amount - buy_amount
+                            pnl = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+                            
+                            total_asset += eval_amount
+                            
+                            # 익절가 계산
+                            target_price = state.take_profit_price if state.take_profit_price > 0 else entry_price * (1 + TAKE_PROFIT_TARGET)
+                            take_profit_msg = f" | 익절가: {target_price:,.0f}원"
+                            
+                            if state.trailing_active:
+                                min_profit = entry_price * (1 + TRAILING_MIN_PROFIT)
+                                take_profit_msg += f" (트레일링ON/보장:{min_profit:,.0f})"
+                            
+                            logger.info(f"[{market}] [가상] 보유 중 | 수량: {volume:,.4f} | "
+                                      f"매수가: {entry_price:,.0f}원 | 현재가: {current_price:,.0f}원 | "
+                                      f"평가금액: {eval_amount:,.0f}원")
+                            logger.info(f"   수익률: {pnl:+.2f}% | "
+                                      f"수익금: {profit_amount:+,.0f}원 | "
+                                      f"손절가: {state.stop_loss_price:,.0f}원{take_profit_msg}")
+                
                 logger.info(f"총 자산: {total_asset:,.0f}원 (KRW: {balance_krw:,.0f}원)")
                 logger.info(f"   현재 수익: {self.cumulative_profit:,.0f}원 (승:{self.cumulative_wins} 패:{self.cumulative_losses})")
                 return
@@ -501,10 +545,27 @@ class MomentumTrader:
                 except ValueError: return
                 
                 logger.info(f"[사용자 매수] {market} {amount_krw:,.0f}원 주문 시도")
-                if market not in self.states: self.states[market] = TradingState(market)
+                if market not in self.states: 
+                    self.states[market] = TradingState(market)
+                
+                state = self.states[market]
                 
                 if DRY_RUN:
                     logger.info(f"[Simulation] 매수 체결 가정: {market}")
+                    current_price = self.current_prices.get(market, 0)
+                    if current_price > 0:
+                        state.position = {
+                            'side': 'bid',
+                            'price': current_price,
+                            'amount': amount_krw,
+                            'volume': amount_krw / current_price
+                        }
+                        state.entry_price = current_price
+                        state.entry_time = datetime.now()
+                        state.highest_price = current_price
+                        state.stop_loss_price = current_price * (1 - INITIAL_STOP_LOSS)
+                        state.take_profit_price = current_price * (1 + TAKE_PROFIT_TARGET)
+                        logger.info(f"[{market}] 가상 매수 완료 | 가격: {current_price:,.0f}원 | 수량: {state.position['volume']:,.8f}")
                 else:
                     self.api.buy_market_order(market, amount_krw)
                 return
